@@ -7,10 +7,10 @@
   "homepage": "https://documentation.ai/agent-score",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/documentation-ai/agent-score.git"
+    "url": "git+https://github.com/KrishnaPrakhya27/documentation-ai-agent-score.git"
   },
   "bugs": {
-    "url": "https://github.com/documentation-ai/agent-score/issues"
+    "url": "https://github.com/KrishnaPrakhya27/documentation-ai-agent-score/issues"
   },
   "keywords": [
     "ai-agents",
