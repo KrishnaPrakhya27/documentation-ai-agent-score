@@ -1,0 +1,81 @@
+{
+  "name": "@documentation-ai/agent-score",
+  "version": "0.1.0",
+  "description": "Agent Readiness Score: how well AI agents can find, read and answer questions from a documentation site, help center or knowledge base.",
+  "license": "MIT",
+  "author": "Documentation.AI (https://documentation.ai)",
+  "homepage": "https://documentation.ai/agent-score",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/documentation-ai/agent-score.git"
+  },
+  "bugs": {
+    "url": "https://github.com/documentation-ai/agent-score/issues"
+  },
+  "keywords": [
+    "ai-agents",
+    "agent-readiness",
+    "documentation",
+    "llms.txt",
+    "afdocs",
+    "mcp",
+    "help-center",
+    "cli"
+  ],
+  "type": "module",
+  "bin": {
+    "agent-score": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "tsx src/cli.ts check",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "afdocs": "0.20.0",
+    "ai": "^6.0.86",
+    "ipaddr.js": "^2.2.0",
+    "node-html-parser": "^7.1.0",
+    "robots-parser": "^3.0.1",
+    "turndown": "^7.2.2",
+    "turndown-plugin-gfm": "^1.0.2",
+    "undici": "^7.29.1",
+    "yaml": "^2.8.2",
+    "zod": "^3.25.76"
+  },
+  "optionalDependencies": {
+    "@ai-sdk/anthropic": "^3.0.120",
+    "@ai-sdk/gateway": "^3.0.46",
+    "@ai-sdk/google": "^3.0.13",
+    "@ai-sdk/openai": "^3.0.29"
+  },
+  "devDependencies": {
+    "@ai-sdk/provider": "^3.0.8",
+    "@types/node": "^22.0.0",
+    "@types/turndown": "^5.0.5",
+    "tsup": "^8.5.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.1"
+  }
+}
