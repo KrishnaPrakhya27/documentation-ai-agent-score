@@ -115,12 +115,20 @@ export async function solveQuestion(
       inputTokens: result.totalUsage.inputTokens ?? 0,
       outputTokens: result.totalUsage.outputTokens ?? 0,
     });
-    return { answer: result.text.trim(), fetches };
+    const answer = result.text.trim();
+    return { answer, fetches, citedUrls: citedUrlsIn(answer) };
   } catch (error) {
     return {
       answer: '',
       fetches,
+      citedUrls: [],
       operationalError: error instanceof Error ? error.message.slice(0, 200) : 'solver failed',
     };
   }
+}
+
+/** The URLs an answer names, in order, without trailing punctuation. */
+export function citedUrlsIn(answer: string): string[] {
+  const urls = (answer.match(/https?:\/\/[^\s)>\]"'`]+/g) ?? []).map((url) => url.replace(/[.,;:!?]+$/, ''));
+  return [...new Set(urls)];
 }

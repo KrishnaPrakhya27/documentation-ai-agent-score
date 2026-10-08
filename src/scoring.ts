@@ -1,282 +1,236 @@
-import type { AfdocsRun } from './afdocs/runAfdocs';
-import type { ScoredCheck } from './checks/freshness';
-import { FRESHNESS_WEIGHTS, gradeFor, PILLAR_WEIGHTS } from './methodology';
+import { ourCheck, round1 } from './checks/ourCheck';
+import { gradeFor, PROVISIONAL_RULES } from './methodology';
 import type {
-  AccessResult,
+  AfdocsSummary,
   AnswerabilityResult,
-  ContentProfile,
-  FreshnessComponent,
-  FreshnessResult,
-  Grade,
-  PillarState,
+  GroupId,
+  GroupScore,
+  OverallScore,
   ReportCheck,
   TopFix,
 } from './report.types';
 
 /**
- * Turns check results into pillar scores and the composite. Developer docs
- * use the unmodified AFDocs score; help centres use an experimental profile
- * over the same checks. When Answerability or Freshness is not measured, the
- * composite is the weighted average of the pillars that were, and says so;
- * without Access there is no composite.
+ * One points table. Every check carries what it is worth and what the site
+ * earned; the score is earned over possible, and a check that could not run
+ * leaves both sums. AFDocs' caps hold the score down the way they hold
+ * AFDocs' own score down. A score is provisional when the scan could not
+ * stand behind it: too few pages, throttling, or too much left unverified.
  */
 
-const HELP_CENTER_GROUPS: Array<{ weight: number; checks: string[] }> = [
-  { weight: 25, checks: ['sitemap', 'robots-ai-access', 'llms-txt-exists'] },
-  {
-    weight: 40,
-    checks: [
-      'rendering-strategy',
-      'page-size-html',
-      'content-start-position',
-      'tabbed-content-serialization',
-    ],
-  },
-  { weight: 20, checks: ['http-status-codes', 'redirect-behavior', 'cache-header-hygiene'] },
-  { weight: 15, checks: ['auth-gate-detection', 'auth-alternative-access'] },
-];
+export const GROUP_IDS: GroupId[] = ['access', 'freshness', 'answerability'];
 
-export const HELP_CENTER_SCORED_CHECKS = new Set(
-  HELP_CENTER_GROUPS.flatMap((group) => group.checks),
-);
-
-export function scoreAccess(
-  run: AfdocsRun,
-  profile: ContentProfile,
-  checks: ReportCheck[],
-): AccessResult {
-  const summary = run.report.summary;
-  const afdocs = {
-    score: run.score.overall,
-    grade: run.score.grade as Grade,
-    passed: summary.pass,
-    total: summary.total,
-    ...(run.score.cap && {
-      cap: {
-        value: run.score.cap.cap,
-        checkId: run.score.cap.checkId,
-        reason: run.score.cap.reason,
-      },
-    }),
-  };
-
-  const measured = summary.total - summary.skip - summary.error;
-  if (measured === 0) {
-    return {
-      state: 'unavailable',
-      score: null,
-      profile,
-      afdocs: null,
-      note: 'None of the access checks could run.',
-    };
-  }
-
-  if (profile === 'developer-docs') {
-    return { state: 'complete', score: run.score.overall, profile, afdocs };
-  }
-  return {
-    state: 'complete',
-    score: helpCenterAccessScore(run, checks),
-    profile,
-    afdocs,
-    note: 'Help-centre profile (experimental): Markdown, llms.txt directives and MCP are reported but do not lower the score.',
-  };
-}
-
-function helpCenterAccessScore(run: AfdocsRun, checks: ReportCheck[]): number {
-  const byId = new Map(checks.map((check) => [check.id, check]));
-  let earned = 0;
-  let possible = 0;
-  for (const group of HELP_CENTER_GROUPS) {
-    const proportions = group.checks
-      .map((id) => checkProportion(id, run, byId.get(id)))
-      .filter((value): value is number => value !== null);
-    if (proportions.length === 0) continue;
-    earned += group.weight * (proportions.reduce((a, b) => a + b, 0) / proportions.length);
-    possible += group.weight;
-  }
-  const raw = possible ? (earned / possible) * 100 : 0;
-  return Math.round(Math.min(raw, helpCenterCap(run)));
-}
-
-/** AFDocs' own caps for pages that need JavaScript or a login; not its llms.txt cap. */
-function helpCenterCap(run: AfdocsRun): number {
-  let cap = 100;
-  for (const id of ['rendering-strategy', 'auth-gate-detection']) {
-    const score = run.score.checkScores[id];
-    if (!score || score.scoreDisplayMode === 'notApplicable') continue;
-    if (score.proportion <= 0.25) cap = Math.min(cap, 39);
-    else if (score.proportion <= 0.5) cap = Math.min(cap, 59);
-  }
-  return cap;
-}
-
-function checkProportion(
-  id: string,
-  run: AfdocsRun,
-  check: ReportCheck | undefined,
-): number | null {
-  const afdocsScore = run.score.checkScores[id];
-  if (afdocsScore && afdocsScore.scoreDisplayMode === 'numeric') {
-    return afdocsScore.proportion;
-  }
-  if (!check) return null;
-  if (check.status === 'pass') return 1;
-  if (check.status === 'warn') return 0.5;
-  if (check.status === 'fail' || check.status === 'info') return 0;
-  return null;
-}
-
-export function scoreFreshness(
-  links: ScoredCheck,
-  recency: ScoredCheck[],
-  paritySource: ReportCheck | undefined,
-): FreshnessResult {
-  const recencyScores = recency
-    .map((entry) => entry.score)
-    .filter((score): score is number => score !== null);
-  const components: FreshnessComponent[] = [
-    {
-      id: 'link-health',
-      label: 'Working links',
-      weight: FRESHNESS_WEIGHTS['link-health'],
-      score: links.score,
-      checkIds: [links.check.id],
-    },
-    {
-      id: 'markdown-parity',
-      label: 'Markdown matches HTML',
-      weight: FRESHNESS_WEIGHTS['markdown-parity'],
-      score: parityScore(paritySource),
-      checkIds: ['markdown-content-parity'],
-    },
-    {
-      id: 'recency',
-      label: 'Dates, changelog and API spec',
-      weight: FRESHNESS_WEIGHTS.recency,
-      score: recencyScores.length
-        ? Math.round(recencyScores.reduce((a, b) => a + b, 0) / recencyScores.length)
-        : null,
-      checkIds: recency.map((entry) => entry.check.id),
-    },
-  ];
-
-  const measured = components.filter((component) => component.score !== null);
-  if (measured.length === 0) {
-    return {
-      state: 'unavailable',
-      score: null,
-      components,
-      reason: 'No freshness signal could be measured on the sampled pages.',
-    };
-  }
-  const weight = measured.reduce((sum, component) => sum + component.weight, 0);
-  const score = Math.round(
-    measured.reduce((sum, component) => sum + component.weight * (component.score ?? 0), 0) /
-      weight,
-  );
-  return { state: 'complete', score, components };
-}
-
-function parityScore(check: ReportCheck | undefined): number | null {
-  if (!check) return null;
-  if (check.status === 'pass') return 100;
-  if (check.status === 'warn') return 60;
-  if (check.status === 'fail') return 20;
-  return null;
-}
-
-const PILLAR_NAMES = ['access', 'answerability', 'freshness'] as const;
-type PillarName = (typeof PILLAR_NAMES)[number];
-
-const PILLAR_LABELS: Record<PillarName, string> = {
+export const GROUP_LABELS: Record<GroupId, string> = {
   access: 'Access',
-  answerability: 'Answerability',
   freshness: 'Freshness',
+  answerability: 'Answerability',
 };
 
-/** Whole-number weights keep the reweighted average exact, so a .5 always rounds up. */
-function weightPercent(pillar: PillarName): number {
-  return Math.round(PILLAR_WEIGHTS[pillar] * 100);
+/** Freshness categories that compare the docs with a source of truth, rather than just watch maintenance. */
+const CURRENCY_CATEGORIES = new Set(['consistency', 'currency']);
+
+export interface ScoreInput {
+  checks: ReportCheck[];
+  afdocs: AfdocsSummary | null;
+  answerability: AnswerabilityResult;
+  coverage: { pagesTested: number; rateLimitedRequests: number };
 }
 
-export function overallScore(pillars: {
-  access: AccessResult;
-  answerability: AnswerabilityResult;
-  freshness: FreshnessResult;
-}): { score: number | null; grade: Grade | null; reason?: string } {
-  const scoreOf = (pillar: PillarName) =>
-    pillars[pillar].state === 'complete' ? pillars[pillar].score : null;
-  if (scoreOf('access') === null) {
+export function scoreReport(input: ScoreInput): { overall: OverallScore; groups: Record<GroupId, GroupScore> } {
+  const groups: Record<GroupId, GroupScore> = {
+    access: groupScore('access', input.checks),
+    freshness: groupScore('freshness', input.checks),
+    answerability: answerabilityGroup(input.checks, input.answerability),
+  };
+  const counted = input.checks.filter((check) => check.points.earned !== null);
+  const earned = round1(counted.reduce((sum, check) => sum + (check.points.earned ?? 0), 0));
+  const possible = round1(counted.reduce((sum, check) => sum + check.points.max, 0));
+
+  if (possible === 0) {
     return {
-      score: null,
-      grade: null,
-      reason: 'Access could not be measured, so there is no overall grade. The other scores are shown.',
+      overall: {
+        score: null,
+        grade: null,
+        earned,
+        possible,
+        provisional: true,
+        provisionalReasons: ['None of the checks could run, so there is nothing to score.'],
+        reason: 'None of the checks could run, so there is no score.',
+      },
+      groups,
     };
   }
 
-  const measured = PILLAR_NAMES.filter((pillar) => scoreOf(pillar) !== null);
-  const weightedSum = measured.reduce((sum, pillar) => sum + weightPercent(pillar) * (scoreOf(pillar) ?? 0), 0);
-  const totalWeight = measured.reduce((sum, pillar) => sum + weightPercent(pillar), 0);
-  const score = Math.round(weightedSum / totalWeight);
-  if (measured.length === PILLAR_NAMES.length) return { score, grade: gradeFor(score) };
-  return { score, grade: gradeFor(score), reason: partialScoreReason(measured, pillars) };
-}
-
-function partialScoreReason(
-  measured: PillarName[],
-  pillars: Record<PillarName, { state: PillarState }>,
-): string {
-  const missing = PILLAR_NAMES.filter((pillar) => !measured.includes(pillar)).map((pillar) =>
-    pillars[pillar].state === 'pending'
-      ? `${PILLAR_LABELS[pillar]} is still being tested and will update this score.`
-      : `${PILLAR_LABELS[pillar]} was not measured for this scan.`,
-  );
-  return [`Based on ${measured.map((pillar) => PILLAR_LABELS[pillar]).join(' and ')}.`, ...missing].join(' ');
-}
-
-/** The three changes likely to raise the score most, largest first. */
-export function pickTopFixes(
-  checks: ReportCheck[],
-  run: AfdocsRun,
-  freshness: FreshnessResult,
-  profile: ContentProfile,
-): TopFix[] {
-  const afdocsMax = Object.values(run.score.checkScores)
-    .filter((score) => score.scoreDisplayMode === 'numeric')
-    .reduce((sum, score) => sum + score.maxScore, 0);
-  const freshnessWeight = freshness.components
-    .filter((component) => component.score !== null)
-    .reduce((sum, component) => sum + component.weight, 0);
-
-  const impact = (check: ReportCheck): number => {
-    if (!check.scored || !check.fix) return 0;
-    if (check.source === 'afdocs' && profile === 'developer-docs') {
-      const score = run.score.checkScores[check.id];
-      if (!score || !afdocsMax) return 0;
-      return (PILLAR_WEIGHTS.access * 100 * score.maxScore * (1 - score.proportion)) / afdocsMax;
-    }
-    if (check.pillar === 'freshness') {
-      const component = freshness.components.find((entry) => entry.checkIds.includes(check.id));
-      if (!component || component.score === null || !freshnessWeight) return 0;
-      const share = component.weight / freshnessWeight / Math.max(1, component.checkIds.length);
-      return PILLAR_WEIGHTS.freshness * share * (100 - component.score);
-    }
-    return check.status === 'fail' ? 1 : 0.5;
+  const raw = Math.round((earned / possible) * 100);
+  const cap = input.afdocs?.cap && input.afdocs.cap.value < raw ? input.afdocs.cap : undefined;
+  const score = cap ? cap.value : raw;
+  const provisionalReasons = provisionalReasonsFor(input.checks, input.coverage);
+  return {
+    overall: {
+      score,
+      grade: gradeFor(score),
+      earned,
+      possible,
+      ...(cap && { cap }),
+      provisional: provisionalReasons.length > 0,
+      provisionalReasons,
+      reason: scoreReason(groups, input.answerability, earned, possible, cap),
+    },
+    groups,
   };
+}
 
-  const candidates = checks
-    .filter((check) => check.fix && ['fail', 'warn', 'info'].includes(check.status))
-    .map((check) => ({ check, impact: impact(check) }))
-    .sort((a, b) => b.impact - a.impact || statusRank(a.check) - statusRank(b.check));
+function groupScore(id: GroupId, checks: ReportCheck[]): GroupScore {
+  const counted = checks.filter((check) => check.group === id && check.points.earned !== null);
+  const earned = round1(counted.reduce((sum, check) => sum + (check.points.earned ?? 0), 0));
+  const possible = round1(counted.reduce((sum, check) => sum + check.points.max, 0));
+  if (possible === 0) {
+    return {
+      id,
+      label: GROUP_LABELS[id],
+      state: 'unavailable',
+      earned,
+      possible,
+      score: null,
+      note: id === 'freshness' ? 'No freshness check could run on this site.' : 'None of the access checks could run.',
+    };
+  }
+  const maintenanceOnly =
+    id === 'freshness' && !counted.some((check) => CURRENCY_CATEGORIES.has(check.category));
+  return {
+    id,
+    label: GROUP_LABELS[id],
+    state: 'complete',
+    earned,
+    possible,
+    score: Math.round((earned / possible) * 100),
+    ...(maintenanceOnly && {
+      note: 'Maintenance only: no API spec was found, so nothing here verifies that the content is current.',
+    }),
+  };
+}
 
-  return candidates.slice(0, 3).map(({ check }) => ({
-    checkId: check.id,
-    title: check.title,
-    fix: check.fix as string,
-  }));
+function answerabilityGroup(checks: ReportCheck[], answerability: AnswerabilityResult): GroupScore {
+  if (answerability.state === 'complete') return groupScore('answerability', checks);
+  return {
+    id: 'answerability',
+    label: GROUP_LABELS.answerability,
+    state: answerability.state,
+    earned: 0,
+    possible: 0,
+    score: null,
+    note:
+      answerability.state === 'pending'
+        ? 'An agent is answering questions from these pages now; this part is added when it finishes.'
+        : (answerability.reason ?? 'Answerability was not tested in this scan.'),
+  };
+}
+
+function scoreReason(
+  groups: Record<GroupId, GroupScore>,
+  answerability: AnswerabilityResult,
+  earned: number,
+  possible: number,
+  cap: OverallScore['cap'],
+): string {
+  const parts = [`${earned} of ${possible} possible points.`];
+  if (answerability.state === 'pending') {
+    parts.push('Answerability is still being tested and will be added when it finishes.');
+  }
+  if (groups.freshness.note) parts.push(groups.freshness.note);
+  if (cap) parts.push(`Held at ${cap.value} by an AFDocs cap: ${cap.reason}`);
+  return parts.join(' ');
+}
+
+/** Why a score is provisional; empty when the scan can stand behind it. */
+export function provisionalReasonsFor(
+  checks: ReportCheck[],
+  coverage: { pagesTested: number; rateLimitedRequests: number },
+): string[] {
+  const reasons: string[] = [];
+  if (coverage.pagesTested < PROVISIONAL_RULES.minPages) {
+    reasons.push(
+      `Only ${coverage.pagesTested} page${coverage.pagesTested === 1 ? '' : 's'} could be read; a score needs at least ${PROVISIONAL_RULES.minPages}.`,
+    );
+  }
+  if (coverage.rateLimitedRequests > 0) {
+    reasons.push(
+      `The site refused ${coverage.rateLimitedRequests} request${coverage.rateLimitedRequests === 1 ? '' : 's'} as too many, so some checks may read low.`,
+    );
+  }
+  const applicable = checks.filter((check) => check.status !== 'skip');
+  const unverified = applicable.filter((check) => check.status === 'unverified').length;
+  if (applicable.length && unverified / applicable.length > PROVISIONAL_RULES.maxUnverifiedShare) {
+    reasons.push(`${unverified} of the ${applicable.length} checks that apply could not be verified.`);
+  }
+  return reasons;
+}
+
+/** The Answerability checks, from a completed run; none while it is pending or unavailable. */
+export function answerabilityChecks(result: AnswerabilityResult): ReportCheck[] {
+  if (result.state !== 'complete' || result.total === 0) return [];
+  const retrieved = result.retrieved / result.total;
+  const correct = result.correct / result.total;
+  const checks = [
+    ourCheck(
+      'evidence-retrieved',
+      retrieved === 1 ? 'pass' : retrieved >= 0.5 ? 'warn' : 'fail',
+      retrieved,
+      `The agent reached the page holding the answer for ${result.retrieved} of ${result.total} questions.`,
+      retrieved === 1
+        ? undefined
+        : 'Make every page reachable from the docs entry page and llms.txt, with titles in the words people use, so an agent can find the page that answers a question.',
+    ),
+    ourCheck(
+      'answers-correct',
+      correct === 1 ? 'pass' : correct >= 0.5 ? 'warn' : 'fail',
+      correct,
+      `${result.correct} of ${result.total} answers agreed with the sentence they came from.`,
+      correct === 1
+        ? undefined
+        : 'State each answer plainly near the top of the section that covers it, in the words people use when they ask, so an agent reading the page gives the right answer.',
+    ),
+  ];
+  if (result.answered === 0) {
+    checks.push(ourCheck('answers-supported', 'skip', null, 'The agent gave no answers to check for support.'));
+  } else {
+    const supported = result.supported / result.answered;
+    checks.push(
+      ourCheck(
+        'answers-supported',
+        supported === 1 ? 'pass' : supported >= 0.5 ? 'warn' : 'fail',
+        supported,
+        `${result.supported} of ${result.answered} answers were backed by the pages the agent cited.`,
+        supported === 1
+          ? undefined
+          : 'Keep each fact on the page that makes the claim, so an answer can cite the passage it came from.',
+      ),
+    );
+  }
+  return checks;
+}
+
+/** The three changes that would recover the most points, largest first. */
+export function pickTopFixes(checks: ReportCheck[]): TopFix[] {
+  return checks
+    .filter((check) => check.fix && check.points.earned !== null && (check.status === 'fail' || check.status === 'warn'))
+    .map((check) => ({ check, lost: round1(check.points.max - (check.points.earned ?? 0)) }))
+    .filter((entry) => entry.lost > 0)
+    .sort((a, b) => b.lost - a.lost || statusRank(a.check) - statusRank(b.check))
+    .slice(0, 3)
+    .map(({ check, lost }) => ({
+      checkId: check.id,
+      title: check.title,
+      fix: check.fix as string,
+      points: lost,
+    }));
 }
 
 function statusRank(check: ReportCheck): number {
-  return check.status === 'fail' ? 0 : check.status === 'warn' ? 1 : 2;
+  return check.status === 'fail' ? 0 : 1;
+}
+
+/** The limitation line that states a provisional score; absent when the score stands. */
+export function provisionalLimitation(overall: OverallScore): string | null {
+  return overall.provisional ? `The score is provisional: ${overall.provisionalReasons.join(' ')}` : null;
 }

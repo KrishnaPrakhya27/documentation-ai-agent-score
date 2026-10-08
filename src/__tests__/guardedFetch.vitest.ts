@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  classifyFetchError,
   RequestBudgetError,
   RobotsDisallowedError,
   TooManyRedirectsError,
@@ -8,6 +9,7 @@ import {
 import {
   GuardedFetcher,
   retryAfterMs,
+  retryWaitMs,
   type GuardedFetcherOptions,
 } from '../transport/guardedFetch';
 import { BlockedTargetError } from '../transport/publicAddress';
@@ -99,9 +101,17 @@ describe('robots.txt', () => {
       '/robots.txt': { status: 500, body: 'oops' },
       '/docs': { body: 'docs' },
     });
-    await expect(second.fetcher.fetch(`${second.site.origin}/docs`)).rejects.toBeInstanceOf(
-      RobotsDisallowedError,
-    );
+    const error = await second.fetcher.fetch(`${second.site.origin}/docs`).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(RobotsDisallowedError);
+    expect((error as RobotsDisallowedError).state).toBe('unreachable');
+    expect(classifyFetchError(error)).toBe('robots_unreachable');
+  });
+
+  it('reports a host that does not exist as a DNS failure, not a robots block', async () => {
+    const { fetcher } = await setUp({}, { validateUrl: (url) => new URL(url) });
+    const error = await fetcher.fetch('http://agent-score-no-such-host.invalid/').catch((e: unknown) => e);
+    expect(error).not.toBeInstanceOf(RobotsDisallowedError);
+    expect(classifyFetchError(error)).toBe('dns');
   });
 
   it('spaces requests by the Crawl-delay', async () => {
@@ -224,6 +234,39 @@ describe('limits', () => {
     });
     const response = await fetcher.fetch(`${site.origin}/busy`);
     expect(response.status).toBe(429);
+    expect(fetcher.stats().rateLimited).toBe(1);
+  });
+
+  it('backs off and retries a 429 that names no usable wait', async () => {
+    const { site, fetcher } = await setUp({
+      '/busy': (_request, hit) =>
+        hit === 1 ? { status: 429, headers: { 'retry-after': '0' } } : { body: 'ready' },
+    });
+    const response = await fetcher.fetch(`${site.origin}/busy`);
+    expect(await response.text()).toBe('ready');
+    expect(fetcher.stats()).toMatchObject({ retryAfterWaits: 1, rateLimited: 0 });
+  });
+
+  it('asks again for a page that was refused instead of reusing the refusal', async () => {
+    const { site, fetcher } = await setUp({
+      '/busy': (_request, hit) =>
+        hit === 1 ? { status: 429, headers: { 'retry-after': '120' } } : { body: 'ready' },
+    });
+    expect((await fetcher.fetch(`${site.origin}/busy`)).status).toBe(429);
+    expect(await (await fetcher.fetch(`${site.origin}/busy`)).text()).toBe('ready');
+    expect(site.hitsFor('/busy')).toHaveLength(2);
+  });
+
+  it('spaces later requests to a site that refused one', async () => {
+    const { site, fetcher } = await setUp({
+      '/busy': { status: 429, headers: { 'retry-after': '120' } },
+      '/a': { body: 'a' },
+      '/b': { body: 'b' },
+    });
+    await fetcher.fetch(`${site.origin}/busy`);
+    await Promise.all(['/a', '/b'].map((path) => fetcher.fetch(`${site.origin}${path}`)));
+    const starts = ['/a', '/b'].map((path) => site.hitsFor(path)[0].at).sort((x, y) => x - y);
+    expect(starts[1] - starts[0]).toBeGreaterThanOrEqual(900);
   });
 
   it('serves a repeated GET from the scan cache', async () => {
@@ -262,6 +305,15 @@ describe('the default guard', () => {
       BlockedTargetError,
     );
     await guarded.close();
+  });
+});
+
+describe('retryWaitMs', () => {
+  it("uses the site's wait when it names one, and doubles from 1s when it does not", () => {
+    expect(retryWaitMs('5', 0)).toBe(5_000);
+    expect(retryWaitMs(null, 0)).toBe(1_000);
+    expect(retryWaitMs('0', 1)).toBe(2_000);
+    expect(retryWaitMs('soon', 2)).toBe(4_000);
   });
 });
 

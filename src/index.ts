@@ -4,7 +4,7 @@
  * runAnswerability and finalizeReport themselves.
  */
 
-export { publicReportUrl, scanSite, type ScanSiteOptions, type ScanSiteResult } from './scanSite';
+export { reportUrlForKey, scanSite, type ScanSiteOptions, type ScanSiteResult } from './scanSite';
 export {
   createScanFetcher,
   runTechnicalAssessment,
@@ -12,7 +12,7 @@ export {
   type TechnicalAssessment,
   type TechnicalAssessmentInput,
 } from './assess';
-export { estimateCostUsd, runAnswerability } from './answerability/runAnswerability';
+export { emptyAnswerability, estimateCostUsd, runAnswerability } from './answerability/runAnswerability';
 export {
   AI_PROVIDERS,
   AiConfigError,
@@ -33,16 +33,18 @@ export { finalizeReport } from './finalize';
 export {
   AFDOCS_VERSION,
   ANSWERABILITY_LIMITS,
+  CHECK_POINTS,
   ENGINE_VERSION,
-  FRESHNESS_WEIGHTS,
   METHODOLOGY_VERSION,
-  PILLAR_WEIGHTS,
+  PROVISIONAL_RULES,
   ROBOTS_TOKEN,
   SCAN_LIMITS,
   USER_AGENT,
   gradeFor,
 } from './methodology';
-export { overallScore } from './scoring';
+export { CRAWLER_POLICY } from './checks/crawlerAccess';
+export { CATEGORY_LABELS } from './reportText';
+export { GROUP_IDS, GROUP_LABELS, answerabilityChecks, pickTopFixes, scoreReport } from './scoring';
 export {
   UnscannableTargetError,
   resolveTarget,

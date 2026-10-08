@@ -35,23 +35,27 @@ const options = {
   maxConcurrency: 3,
 };
 
+function fixtureFetcher(maxRequests: number): GuardedFetcher {
+  return new GuardedFetcher({
+    userAgent: 'test-agent',
+    robotsToken: 'test-agent',
+    requestTimeoutMs: 5_000,
+    maxBodyBytes: 2 * 1024 * 1024,
+    maxRedirects: 5,
+    minIntervalMs: 0,
+    maxConcurrentPerOrigin: 3,
+    maxRequests,
+    maxRetryAfterMs: 0,
+    validateUrl: allowOnly(site.origin),
+    isAllowedAddress: () => true,
+  });
+}
+
 describe('runAfdocs', () => {
   it('matches native AFDocs verdicts and score on the same site', async () => {
     const native = await runChecks(`${site.origin}/docs`, options);
 
-    const fetcher = new GuardedFetcher({
-      userAgent: 'test-agent',
-      robotsToken: 'test-agent',
-      requestTimeoutMs: 5_000,
-      maxBodyBytes: 2 * 1024 * 1024,
-      maxRedirects: 5,
-      minIntervalMs: 0,
-      maxConcurrentPerOrigin: 3,
-      maxRequests: 500,
-      maxRetryAfterMs: 0,
-      validateUrl: allowOnly(site.origin),
-      isAllowedAddress: () => true,
-    });
+    const fetcher = fixtureFetcher(500);
     const ours = await runAfdocs(`${site.origin}/docs`, fetcher, options);
     await fetcher.close();
 
@@ -63,5 +67,58 @@ describe('runAfdocs', () => {
 
     const { computeScore } = await import('afdocs');
     expect(ours.score.overall).toBe(computeScore(native).overall);
+  });
+
+  it('leaves checks cut short by our own request limit out of the score instead of failing them', async () => {
+    const fullFetcher = fixtureFetcher(500);
+    const full = await runAfdocs(`${site.origin}/docs`, fullFetcher, options);
+    await fullFetcher.close();
+
+    const limitedFetcher = fixtureFetcher(25);
+    const limited = await runAfdocs(`${site.origin}/docs`, limitedFetcher, options);
+    await limitedFetcher.close();
+
+    const fullStatus = new Map(full.report.results.map((result) => [result.id, result.status]));
+    const unfairlyFailed = limited.report.results.filter(
+      (result) =>
+        (result.status === 'fail' || result.status === 'warn') && fullStatus.get(result.id) === 'pass',
+    );
+    expect(unfairlyFailed.map((result) => result.id)).toEqual([]);
+    expect(limited.report.results.some((result) => result.message.startsWith('Not finished'))).toBe(true);
+  });
+
+  it('leaves checks out of the score when robots.txt kept our scanner from pages they needed', async () => {
+    const guardedRoutes: Record<string, FixtureRoute> = {};
+    const guardedSite = await startFixtureSite(guardedRoutes);
+    Object.assign(guardedRoutes, docsSiteRoutes(guardedSite.origin), {
+      '/robots.txt': { headers: { 'content-type': 'text/plain' }, body: 'User-agent: test-agent\nDisallow: /docs/install' },
+    });
+    const fetcher = new GuardedFetcher({
+      userAgent: 'test-agent',
+      robotsToken: 'test-agent',
+      requestTimeoutMs: 5_000,
+      maxBodyBytes: 2 * 1024 * 1024,
+      maxRedirects: 5,
+      minIntervalMs: 0,
+      maxConcurrentPerOrigin: 3,
+      maxRequests: 500,
+      maxRetryAfterMs: 0,
+      validateUrl: allowOnly(guardedSite.origin),
+      isAllowedAddress: () => true,
+    });
+    const guarded = await runAfdocs(`${guardedSite.origin}/docs`, fetcher, options);
+    expect(fetcher.stats().robotsBlocked.length).toBeGreaterThan(0);
+    await fetcher.close();
+    await guardedSite.close();
+
+    const openFetcher = fixtureFetcher(500);
+    const open = await runAfdocs(`${site.origin}/docs`, openFetcher, options);
+    await openFetcher.close();
+
+    const openStatus = new Map(open.report.results.map((result) => [result.id, result.status]));
+    const unfairlyFailed = guarded.report.results.filter(
+      (result) => (result.status === 'fail' || result.status === 'warn') && openStatus.get(result.id) === 'pass',
+    );
+    expect(unfairlyFailed.map((result) => `${result.id}: ${result.message}`)).toEqual([]);
   });
 });

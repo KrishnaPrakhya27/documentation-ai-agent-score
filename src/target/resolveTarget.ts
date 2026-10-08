@@ -2,7 +2,7 @@ import { classifyFetchError, type FetchFailureCode } from '../transport/errors';
 import type { ScanHttpClient } from '../transport/guardedFetch';
 import type { ContentProfile, ReportTarget } from '../report.types';
 import {
-  apexCandidates,
+  baseDomain,
   guessScope,
   inferProfile,
   isWithin,
@@ -10,12 +10,14 @@ import {
   normalizeSubmittedUrl,
   scopeKey,
   scopeRootHref,
+  subdomainLabel,
 } from './scope';
 
 /**
  * Settles what a submission means before any scan is queued: follows the
- * entry URL's redirects, finds the docs for a bare apex, and refuses targets
- * that cannot be scanned with a reason a person can act on.
+ * entry URL's redirects, as an agent would, and refuses targets that cannot
+ * be scanned with a reason a person can act on. What was submitted is what
+ * gets scored; a bare domain is scored as itself, not swapped for its docs.
  */
 
 export type UnscannableReason =
@@ -37,8 +39,6 @@ export class UnscannableTargetError extends Error {
 export interface ResolvedTarget {
   target: ReportTarget;
   hashRouted: boolean;
-  /** Set when a bare apex was resolved to the docs found at this URL. */
-  detectedFrom: string | null;
 }
 
 export async function resolveTarget(
@@ -47,20 +47,9 @@ export async function resolveTarget(
   requestedProfile?: ContentProfile,
 ): Promise<ResolvedTarget> {
   const submittedUrl = normalizeSubmittedUrl(submitted);
-  const guess = guessScope(submittedUrl);
+  const entryScope = guessScope(submittedUrl);
 
-  let entry = guess.entryUrl;
-  let detectedFrom: string | null = null;
-  if (guess.isApexRoot) {
-    const docs = await findApexDocs(entry, http);
-    if (docs) {
-      detectedFrom = entry.href;
-      entry = docs;
-    }
-  }
-
-  const landed = await reachEntry(entry, http);
-  const entryScope = guessScope(entry);
+  const landed = await reachEntry(entryScope.entryUrl, http);
   const landedScope = guessScope(landed);
   const staysInScope =
     landed.origin === entryScope.scopeRoot.origin &&
@@ -68,6 +57,7 @@ export async function resolveTarget(
   const scope = staysInScope ? entryScope : landedScope;
   // A root that redirects to /en-us/ tells us which locale to sample.
   const locale = scope.locale ?? (staysInScope ? localeInPath(landed) : null);
+  const docsElsewhere = await findDocsElsewhere(submittedUrl, scope.scopeRoot, http);
 
   return {
     target: {
@@ -79,24 +69,73 @@ export async function resolveTarget(
       profile: requestedProfile ?? inferProfile(scope.scopeRoot),
       locale,
       version: scope.version,
+      ...(docsElsewhere && { docsElsewhere }),
     },
-    hashRouted: guess.hashRouted,
-    detectedFrom,
+    hashRouted: entryScope.hashRouted,
   };
 }
 
-async function findApexDocs(apex: URL, http: ScanHttpClient): Promise<URL | null> {
-  const probes = await Promise.allSettled(
-    apexCandidates(apex).map(async (candidate) => {
+/** Hosts whose first label already says "documentation", so no hint is needed. */
+const DOCS_HOST_LABELS = new Set([
+  'docs',
+  'doc',
+  'documentation',
+  'developer',
+  'developers',
+  'dev',
+  'help',
+  'support',
+  'kb',
+  'knowledge',
+  'learn',
+  'api',
+  'guide',
+  'guides',
+  'manual',
+  'reference',
+  'wiki',
+]);
+
+/**
+ * When a bare domain was submitted, where its documentation seems to live:
+ * `docs.<domain>` or `/docs`, whichever answers first as a web page other
+ * than the home page. The scan still scores what was submitted; the report
+ * offers this address as the one to scan for a docs-only score.
+ */
+export async function findDocsElsewhere(
+  submitted: URL,
+  scopeRoot: URL,
+  http: ScanHttpClient,
+): Promise<string | undefined> {
+  if (submitted.pathname !== '/' || scopeRoot.pathname !== '/') return undefined;
+  if (DOCS_HOST_LABELS.has(subdomainLabel(scopeRoot.hostname) ?? '')) return undefined;
+  const domain = baseDomain(scopeRoot.hostname);
+  for (const candidate of [`https://docs.${domain}/`, `${scopeRoot.origin}/docs`]) {
+    try {
       const response = await http.fetch(candidate);
       const type = response.headers.get('content-type') ?? '';
-      return response.status === 200 && type.includes('html') ? new URL(response.url) : null;
-    }),
-  );
-  for (const probe of probes) {
-    if (probe.status === 'fulfilled' && probe.value) return probe.value;
+      if (response.status !== 200 || !/html|markdown/i.test(type)) continue;
+      const landed = new URL(response.url);
+      const isHomePage =
+        landed.origin === scopeRoot.origin && landed.pathname.replace(/\/+$/, '') === '';
+      if (isHomePage || baseDomain(landed.hostname) !== domain) continue;
+      return docsKey(new URL(candidate), landed);
+    } catch {
+      // Not there, not allowed, or not reachable in time: no hint.
+    }
   }
-  return null;
+  return undefined;
+}
+
+/**
+ * The address to suggest: the candidate itself when it answers on its own
+ * host (docs.example.com, even if it lands on an intro page), or, when it
+ * redirects to another host, that host's docs section (example.com/docs).
+ */
+function docsKey(candidate: URL, landed: URL): string {
+  if (landed.origin === candidate.origin) return scopeKey(guessScope(candidate).scopeRoot);
+  const section = landed.pathname.split('/').filter(Boolean)[0];
+  return scopeKey(guessScope(new URL(section ? `/${section}` : '/', landed.origin)).scopeRoot);
 }
 
 async function reachEntry(entry: URL, http: ScanHttpClient): Promise<URL> {
@@ -137,6 +176,8 @@ function describeFailure(entry: URL, reason: FetchFailureCode): string {
       return `${entry.hostname} is not a public website, so it cannot be scanned.`;
     case 'robots':
       return `${entry.hostname} asks crawlers not to read this page in its robots.txt, so we did not scan it.`;
+    case 'robots_unreachable':
+      return `${entry.hostname} did not let us read its robots.txt just now, so we did not scan it. Try again in a moment.`;
     case 'dns':
       return `We could not find ${entry.hostname}. Check the spelling of the address.`;
     case 'timeout':

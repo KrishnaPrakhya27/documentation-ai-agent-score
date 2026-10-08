@@ -1,6 +1,6 @@
 import robotsParser from 'robots-parser';
 
-import { RequestBudgetError, ScanDeadlineError } from './errors';
+import { classifyFetchError, RequestBudgetError, ScanDeadlineError } from './errors';
 
 /**
  * robots.txt rules per origin, read once per scan (RFC 9309). A missing file
@@ -80,8 +80,10 @@ export class RobotsPolicy {
     try {
       response = await this.download(robotsUrl);
     } catch (error) {
-      // Our own time or request limit says nothing about the site's rules.
-      if (error instanceof ScanDeadlineError || error instanceof RequestBudgetError) {
+      // Our own limits, and any failure to reach the host at all, say nothing
+      // about the site's rules: the request that needed the file reports them.
+      const code = classifyFetchError(error);
+      if (code !== 'other' && code !== 'redirects') {
         this.files.delete(origin);
         throw error;
       }

@@ -1,11 +1,13 @@
+import { round1 } from './checks/ourCheck';
 import type { AgentScoreReport, AnswerabilityResult, TopFix } from './report.types';
 import { buildFixPrompt } from './reportText';
-import { overallScore } from './scoring';
+import { answerabilityChecks, pickTopFixes, provisionalLimitation, scoreReport } from './scoring';
 
 /**
- * Settles a technical report once Answerability has run (or cannot): fills
- * the pillar, computes the composite, and, when agents failed several
- * questions, leads the top fixes with what would have let them answer.
+ * Settles a technical report once Answerability has run (or cannot): adds
+ * its checks to the table, rescores, and, when agents failed several
+ * questions for one reason, leads the top fixes with what would have let
+ * them answer.
  */
 
 const ANSWERABILITY_FIXES: Array<{ pattern: RegExp; fix: string }> = [
@@ -33,26 +35,53 @@ export function finalizeReport(
   reportUrl: string,
   now = Date.now(),
 ): AgentScoreReport {
-  const pillars = { ...technical.pillars, answerability };
+  const checks = [
+    ...technical.checks.filter((check) => check.group !== 'answerability'),
+    ...answerabilityChecks(answerability),
+  ];
+  const { overall, groups } = scoreReport({
+    checks,
+    afdocs: technical.afdocs,
+    answerability,
+    coverage: technical.coverage,
+  });
   const report: AgentScoreReport = {
     ...technical,
     stage: 'final',
-    pillars,
-    overall: overallScore(pillars),
-    topFixes: withAnswerabilityFix(technical.topFixes, answerability),
+    answerability,
+    checks,
+    overall,
+    groups,
+    topFixes: withAnswerabilityFix(pickTopFixes(checks), checks, answerability),
     timings: { ...technical.timings, completedAt: new Date(now).toISOString() },
   };
-  if (answerability.state !== 'complete' && answerability.reason) {
-    report.limitations = [...technical.limitations, answerability.reason];
-  }
+  report.limitations = finalLimitations(technical.limitations, overall, answerability);
   report.fixPrompt = buildFixPrompt(report, reportUrl);
   return report;
 }
 
-function withAnswerabilityFix(fixes: TopFix[], answerability: AnswerabilityResult): TopFix[] {
-  if (answerability.state !== 'complete' || answerability.score === null) return fixes;
+/** The technical stage's notes with the provisional line restated for the final score, plus why Answerability is missing. */
+export function finalLimitations(
+  technical: string[],
+  overall: AgentScoreReport['overall'],
+  answerability: AnswerabilityResult,
+): string[] {
+  const notes = technical.filter((note) => !note.startsWith('The score is provisional:'));
+  const provisional = provisionalLimitation(overall);
+  if (provisional) notes.push(provisional);
+  if (answerability.state !== 'complete' && answerability.reason) notes.push(answerability.reason);
+  return notes;
+}
+
+/** One fix for the cause behind most misses, in place of the generic Answerability fixes. */
+function withAnswerabilityFix(
+  fixes: TopFix[],
+  checks: AgentScoreReport['checks'],
+  answerability: AnswerabilityResult,
+): TopFix[] {
+  if (answerability.state !== 'complete' || answerability.total === 0) return fixes;
   const failures = answerability.transcript.filter((entry) => entry.verdict !== 'correct');
-  if (failures.length < 2 || answerability.score >= 80) return fixes;
+  if (failures.length < 2 || answerability.correct / answerability.total >= 0.8) return fixes;
 
   const counts = ANSWERABILITY_FIXES.map((candidate) => ({
     candidate,
@@ -61,10 +90,15 @@ function withAnswerabilityFix(fixes: TopFix[], answerability: AnswerabilityResul
   const leading = counts[0];
   if (!leading || leading.count === 0) return fixes;
 
+  const lost = checks
+    .filter((check) => check.group === 'answerability' && check.points.earned !== null)
+    .reduce((sum, check) => sum + check.points.max - (check.points.earned ?? 0), 0);
   const fix: TopFix = {
     checkId: 'answerability',
     title: `Agents could not answer ${failures.length} of ${answerability.total} questions`,
     fix: leading.candidate.fix,
+    points: round1(lost),
   };
-  return [fix, ...fixes].slice(0, 3);
+  const others = fixes.filter((entry) => !checks.some((check) => check.group === 'answerability' && check.id === entry.checkId));
+  return [fix, ...others].sort((a, b) => b.points - a.points).slice(0, 3);
 }

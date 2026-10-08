@@ -8,12 +8,15 @@ import {
   type ScoreResult,
 } from 'afdocs';
 
+import { RobotsDisallowedError } from '../transport/errors';
 import type { ScanHttpClient } from '../transport/guardedFetch';
 
 /**
  * Runs the pinned AFDocs checks with our guarded transport in place of its
  * global fetch. The loop mirrors AFDocs' own `runChecks` (MIT, agent-ecosystem/
- * afdocs 0.20.0, src/runner.ts) exactly, including its dependency rules;
+ * afdocs 0.20.0, src/runner.ts), including its dependency rules, with one
+ * difference: a check cut short by our own limits or robots.txt obedience is
+ * unfinished, not failed.
  * `runChecks` itself offers no way to inject the HTTP client.
  */
 
@@ -39,6 +42,28 @@ export interface AfdocsHooks {
   minPages?: number;
 }
 
+/** Why our scanner, not the site, stopped a check from reading what it needed. */
+type OurCutOff = 'limit' | 'robots' | 'robots_unreachable';
+
+const CUT_OFF_MESSAGES: Record<OurCutOff, string> = {
+  limit: 'the scan reached its time or request limit before this check could read everything it needed',
+  robots: "robots.txt asked our scanner not to read some pages this check needed, and we follow it",
+  robots_unreachable: 'a robots.txt this check depended on could not be read, so our scanner did not fetch those pages',
+};
+
+/**
+ * AFDocs counts a request that never completed as the site failing. When our
+ * own limits or our obeying robots.txt stopped it, the check is marked
+ * unfinished and left out of the score instead.
+ */
+function withoutOurCutOff(result: CheckResult, reason: OurCutOff): CheckResult {
+  return {
+    ...result,
+    status: 'error',
+    message: `Not finished: ${CUT_OFF_MESSAGES[reason]}, so it is left out of the score. (${result.message})`,
+  };
+}
+
 export async function runAfdocs(
   baseUrl: string,
   http: ScanHttpClient,
@@ -46,7 +71,20 @@ export async function runAfdocs(
   hooks: AfdocsHooks = {},
 ): Promise<AfdocsRun> {
   const ctx = createContext(baseUrl, options);
-  ctx.http = http;
+  let cutOff: OurCutOff | null = null;
+  ctx.http = {
+    fetch: async (url, init) => {
+      try {
+        return await http.fetch(url, init);
+      } catch (error) {
+        if (http.limitReached?.()) cutOff = 'limit';
+        else if (error instanceof RobotsDisallowedError) {
+          cutOff ??= error.state === 'unreachable' ? 'robots_unreachable' : 'robots';
+        }
+        throw error;
+      }
+    },
+  };
   let sampleAnnounced = false;
   const announceSample = () => {
     const sampled = ctx._sampledPages;
@@ -84,6 +122,7 @@ export async function runAfdocs(
 
     let result: CheckResult;
     const started = Date.now();
+    cutOff = null;
     try {
       result = await check.run(ctx);
     } catch (error) {
@@ -93,6 +132,9 @@ export async function runAfdocs(
         status: 'error',
         message: `Check error: ${error instanceof Error ? error.message : String(error)}`,
       };
+    }
+    if (cutOff && (result.status === 'fail' || result.status === 'warn')) {
+      result = withoutOurCutOff(result, cutOff);
     }
     hooks.onCheckDone?.(check.id, Date.now() - started);
     results.push(result);

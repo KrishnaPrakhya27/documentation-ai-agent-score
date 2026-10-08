@@ -1,9 +1,9 @@
 import type { FixtureRoute } from './fixtureServer';
 
 /**
- * A small agent-friendly docs site: robots.txt, sitemap, llms.txt and six
- * pages served as HTML and as Markdown. Tests override single routes to
- * break one property at a time.
+ * A small agent-friendly docs site: robots.txt, sitemap, llms.txt, an
+ * OpenAPI file and six pages served as HTML and as Markdown. Tests override
+ * single routes to break one property at a time.
  */
 
 const PAGES = [
@@ -27,17 +27,27 @@ function pageHtml(slug: string, origin: string): string {
 <main><article class="theme-doc-markdown">
 <h1>${title}</h1>
 <p>This page explains ${title} for Acme. To create an API key, open Settings and choose API keys, then press Create key.</p>
-<h2>Example</h2>
+<h2 id="example">Example</h2>
 <pre><code>curl https://api.acme.test/v1/widgets</code></pre>
-<p>Call <code>GET /v1/widgets</code> to list widgets. <a href="/docs/install">Install guide</a>.</p>
+<p>Call <code>GET /v1/widgets</code> to list widgets. <a href="/docs/install">Install guide</a>, see <a href="/docs/install#example">its example</a>.</p>
+<p>The old <code>GET /v1/legacy-widgets</code> endpoint is deprecated; use <code>GET /v1/widgets</code> instead.</p>
 </article></main>
 </body></html>`;
 }
 
 function pageMarkdown(slug: string): string {
   const title = slug.replace(/-/g, ' ');
-  return `# ${title}\n\nThis page explains ${title} for Acme. To create an API key, open Settings and choose API keys, then press Create key.\n\n## Example\n\n\`\`\`\ncurl https://api.acme.test/v1/widgets\n\`\`\`\n\nCall \`GET /v1/widgets\` to list widgets. [Install guide](/docs/install).\n`;
+  return `# ${title}\n\nThis page explains ${title} for Acme. To create an API key, open Settings and choose API keys, then press Create key.\n\n## Example\n\n\`\`\`\ncurl https://api.acme.test/v1/widgets\n\`\`\`\n\nCall \`GET /v1/widgets\` to list widgets. [Install guide](/docs/install), see [its example](/docs/install#example).\n\nThe old \`GET /v1/legacy-widgets\` endpoint is deprecated; use \`GET /v1/widgets\` instead.\n`;
 }
+
+const OPENAPI = {
+  openapi: '3.1.0',
+  info: { title: 'Acme API', version: '1.0.0' },
+  paths: {
+    '/v1/widgets': { get: { summary: 'List widgets' } },
+    '/v1/legacy-widgets': { get: { summary: 'List widgets (old)', deprecated: true } },
+  },
+};
 
 export function docsSiteRoutes(origin: string): Record<string, FixtureRoute> {
   const routes: Record<string, FixtureRoute> = {
@@ -57,6 +67,10 @@ export function docsSiteRoutes(origin: string): Record<string, FixtureRoute> {
       body: `# Acme Docs\n\n> Documentation for Acme.\n\n## Docs\n\n${PAGES.map(
         (slug) => `- [${slug}](${origin}/docs/${slug}.md): About ${slug}`,
       ).join('\n')}\n`,
+    },
+    '/docs/openapi.json': {
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(OPENAPI),
     },
   };
   for (const slug of PAGES) {

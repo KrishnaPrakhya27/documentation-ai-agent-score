@@ -1,19 +1,22 @@
-import { afdocsChecks } from './afdocs/afdocsChecks';
+import { afdocsChecks, summarizeAfdocs } from './afdocs/afdocsChecks';
 import {
   llmsTxtFrom,
   runAfdocs,
   type AfdocsRun,
   type AfdocsSample,
 } from './afdocs/runAfdocs';
+import { emptyAnswerability } from './answerability/runAnswerability';
 import { checkAgentSkills, checkLlmsFullTxt, checkMcpServer } from './checks/agentProtocols';
 import type { BaseCheckInput, CheckInput } from './checks/checkInput';
-import { checkRobotsAiAccess, checkSitemap } from './checks/crawlerAccess';
+import { checkCrawlerPermissions, checkSitemapCoverage } from './checks/crawlerAccess';
 import {
-  checkBrokenLinks,
-  checkChangelog,
-  checkOpenApiDrift,
-  checkUpdateDates,
+  checkApiSpecMatch,
+  checkDeprecationNotices,
+  checkLinksAndAnchors,
+  checkSitemapLive,
+  checkUpdateInfo,
 } from './checks/freshness';
+import { loadOpenApi } from './checks/openapi';
 import { parsePage } from './checks/pageContent';
 import { detectPlatform, isHelpCenterPlatform } from './checks/platform';
 import { loadScopeSitemap, pickEvenly, type ScopeSitemap } from './checks/sitemapIndex';
@@ -25,26 +28,16 @@ import {
   SCAN_LIMITS,
   USER_AGENT,
 } from './methodology';
-import type {
-  AgentScoreReport,
-  AnswerabilityResult,
-  ReportCheck,
-  ReportTarget,
-} from './report.types';
+import type { AgentScoreReport, OverallScore, ReportCheck, ReportTarget } from './report.types';
 import { buildFixPrompt, siteName } from './reportText';
-import {
-  HELP_CENTER_SCORED_CHECKS,
-  overallScore,
-  pickTopFixes,
-  scoreAccess,
-  scoreFreshness,
-} from './scoring';
-import { GuardedFetcher, type GuardedFetcherOptions } from './transport/guardedFetch';
+import { pickTopFixes, provisionalLimitation, scoreReport } from './scoring';
+import { type FetchStats, GuardedFetcher, type GuardedFetcherOptions } from './transport/guardedFetch';
 
 /**
- * The fast half of a scan: AFDocs, the supplemental protocol checks and
- * Freshness, assembled into a `technical` report with Answerability pending.
- * Runs against a deadline and returns partial evidence rather than hanging.
+ * The fast half of a scan: AFDocs, our access checks and Freshness, plus the
+ * additional interfaces reported outside the score, assembled into a
+ * `technical` report with Answerability pending. Runs against a deadline
+ * and returns partial evidence rather than hanging.
  */
 
 export interface TechnicalAssessmentInput {
@@ -85,7 +78,7 @@ export async function runTechnicalAssessment(
     const early = Promise.all([
       checkLlmsFullTxt(base),
       checkAgentSkills(base),
-      checkRobotsAiAccess(base),
+      checkCrawlerPermissions(base),
     ]);
 
     // Page checks start as soon as AFDocs has picked its sample and then share
@@ -105,52 +98,44 @@ export async function runTechnicalAssessment(
     const afdocsDone = runChecksAndAnnounce();
     const pageStage = runPageChecksWhenSampled();
 
-    const [afdocs, page, [llmsFull, skills, robots]] = await Promise.all([
+    const [afdocs, page, [llmsFull, skills, crawlers]] = await Promise.all([
       afdocsDone,
       pageStage,
       early,
     ]);
     const { target, platform, parsed } = page;
-    const profile = target.profile;
 
-    const checks = applyProfile(
-      [
-        ...afdocsChecks(afdocs),
-        robots,
-        page.sitemap,
-        llmsFull,
-        page.mcp,
-        skills,
-        page.links.check,
-        page.dates.check,
-        page.changelog.check,
-        page.openapi.check,
-      ],
-      profile,
-    );
-
-    const access = scoreAccess(afdocs, profile, checks);
-    const freshness = scoreFreshness(
+    const checks: ReportCheck[] = [
+      ...afdocsChecks(afdocs),
+      crawlers,
+      page.sitemapCoverage,
+      page.updateInfo,
       page.links,
-      [page.dates, page.changelog, page.openapi],
-      checks.find((check) => check.id === 'markdown-content-parity'),
-    );
-    const answerability: AnswerabilityResult = input.answerabilityPlanned
-      ? { state: 'pending', score: null, passed: 0, total: 0, transcript: [] }
-      : {
-          state: 'unavailable',
-          score: null,
-          passed: 0,
-          total: 0,
-          transcript: [],
-          reason:
-            input.answerabilityUnavailableReason ?? 'Answerability was not tested for this scan.',
-        };
-    const pillars = { access, answerability, freshness };
+      page.sitemapLive,
+      page.apiSpec,
+      page.deprecations,
+    ];
+    const additionalChecks = [page.mcp, llmsFull, skills];
+    const answerability = input.answerabilityPlanned
+      ? emptyAnswerability('pending')
+      : emptyAnswerability(
+          'unavailable',
+          input.answerabilityUnavailableReason ?? 'Answerability was not tested for this scan.',
+        );
     const stats = fetcher.stats();
+    const coverage = {
+      pagesDiscovered: afdocs.totalPages,
+      pagesTested: afdocs.sampledUrls.length,
+      sampledUrls: afdocs.sampledUrls,
+      discoverySources: afdocs.report.discoverySources ?? [],
+      requests: stats.requests,
+      rateLimitedRequests: stats.rateLimited,
+    };
+    const afdocsSummary = summarizeAfdocs(afdocs);
+    const { overall, groups } = scoreReport({ checks, afdocs: afdocsSummary, answerability, coverage });
 
     const report: AgentScoreReport = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       methodology: {
         version: METHODOLOGY_VERSION,
         engineVersion: ENGINE_VERSION,
@@ -161,24 +146,16 @@ export async function runTechnicalAssessment(
       target,
       site: siteName(parsed, target.domain),
       platform,
-      overall: overallScore(pillars),
-      pillars,
+      overall,
+      afdocs: afdocsSummary,
+      groups,
+      answerability,
       checks,
-      topFixes: pickTopFixes(checks, afdocs, freshness, profile),
+      additionalChecks,
+      topFixes: pickTopFixes(checks),
       fixPrompt: '',
-      coverage: {
-        pagesDiscovered: afdocs.totalPages,
-        pagesTested: afdocs.sampledUrls.length,
-        sampledUrls: afdocs.sampledUrls,
-        discoverySources: afdocs.report.discoverySources ?? [],
-        requests: stats.requests,
-      },
-      limitations: limitationsFor(
-        input,
-        afdocs.sampledUrls.length,
-        stats.robotsBlocked.length,
-        checks,
-      ),
+      coverage,
+      limitations: limitationsFor(input, coverage.pagesTested, stats, checks, overall),
       timings: {
         startedAt,
         technicalCompletedAt: new Date(now()).toISOString(),
@@ -200,34 +177,40 @@ async function runPageChecks(
   now: () => number,
 ) {
   const pages = await readPages(base.fetcher, [input.target.resolvedUrl, ...sample.sampledUrls]);
-  const platform = detectPlatform({ pages });
+  const parsed = pages.map((page) => parsePage(page.url, page.html, { lastModified: page.lastModified }));
+  const platform = detectPlatform({
+    pages: pages.map((page, index) => ({ url: page.url, html: page.html, root: parsed[index].root })),
+  });
+  // The profile names the kind of site for the page and the fixes; it does not change the score.
   const profile =
     !input.profileChosen && isHelpCenterPlatform(platform.id) ? 'help-center' : input.target.profile;
   const target: ReportTarget = { ...input.target, profile };
 
-  const parsed = pages.map((page) => parsePage(page.url, page.html));
   const sampled = parsed.filter((page) => sample.sampledUrls.includes(page.url));
-  const checkInput: CheckInput = {
+  const pageSet = sampled.length ? sampled : parsed;
+  const withoutSpec = {
     http: base.http,
     robots: base.robots,
     scopeRoot: base.scopeRoot,
     target,
     discoverySources: sample.discoverySources,
-    pages: sampled.length ? sampled : parsed,
+    pages: pageSet,
     llmsTxt: sample.llmsTxt,
     sitemap: base.sitemap,
     now: now(),
   };
+  const checkInput: CheckInput = { ...withoutSpec, openApi: loadOpenApi(withoutSpec) };
 
-  const [mcp, sitemap, links, dates, changelog, openapi] = await Promise.all([
+  const [mcp, sitemapCoverage, links, updateInfo, sitemapLive, apiSpec, deprecations] = await Promise.all([
     checkMcpServer(checkInput),
-    checkSitemap(checkInput),
-    checkBrokenLinks(checkInput),
-    checkUpdateDates(checkInput),
-    checkChangelog(checkInput),
-    checkOpenApiDrift(checkInput),
+    checkSitemapCoverage(checkInput),
+    checkLinksAndAnchors(checkInput),
+    checkUpdateInfo(checkInput),
+    checkSitemapLive(checkInput),
+    checkApiSpecMatch(checkInput),
+    checkDeprecationNotices(checkInput),
   ]);
-  return { target, platform, parsed, mcp, sitemap, links, dates, changelog, openapi };
+  return { target, platform, parsed, mcp, sitemapCoverage, links, updateInfo, sitemapLive, apiSpec, deprecations };
 }
 
 /**
@@ -301,7 +284,7 @@ export function createScanFetcher(
 async function readPages(
   fetcher: GuardedFetcher,
   urls: string[],
-): Promise<Array<{ url: string; html: string }>> {
+): Promise<Array<{ url: string; html: string; lastModified: string | null }>> {
   const unique = [...new Set(urls)];
   const pages = await Promise.all(
     unique.map(async (url) => {
@@ -309,46 +292,37 @@ async function readPages(
         const response = await fetcher.fetch(url);
         const type = response.headers.get('content-type') ?? '';
         if (!response.ok || !type.includes('html')) return null;
-        return { url, html: await response.text() };
+        return { url, html: await response.text(), lastModified: response.headers.get('last-modified') };
       } catch {
         return null;
       }
     }),
   );
-  return pages.filter((page): page is { url: string; html: string } => page !== null);
-}
-
-/** Help centres are scored on a subset; the rest stay visible as information. */
-function applyProfile(checks: ReportCheck[], profile: string): ReportCheck[] {
-  if (profile !== 'help-center') return checks;
-  return checks.map((check) =>
-    check.pillar === 'access'
-      ? { ...check, scored: HELP_CENTER_SCORED_CHECKS.has(check.id) && check.scored !== false }
-      : check,
-  );
+  return pages.filter((page): page is { url: string; html: string; lastModified: string | null } => page !== null);
 }
 
 function limitationsFor(
   input: TechnicalAssessmentInput,
   pagesTested: number,
-  robotsBlocked: number,
+  stats: FetchStats,
   checks: ReportCheck[],
+  overall: OverallScore,
 ): string[] {
+  const robotsBlocked = stats.robotsBlocked.length;
   const notes = [
     `Based on ${pagesTested} sampled page${pagesTested === 1 ? '' : 's'}, chosen deterministically from the sitemap and llms.txt. Pages outside the sample were not read.`,
     'Pages were fetched without running JavaScript, the way most AI agents read the web.',
   ];
-  if (pagesTested < 5) {
-    notes.push('Fewer than five pages could be sampled, so page-level results are indicative only.');
-  }
   if (input.hashRouted) {
     notes.push('The submitted URL routes content after "#/", which agents cannot follow, so only the landing page was reachable.');
   }
   if (robotsBlocked > 0) {
-    notes.push(`robots.txt stopped the scanner from reading ${robotsBlocked} URL${robotsBlocked === 1 ? '' : 's'}; checks that needed them are incomplete.`);
+    notes.push(`robots.txt stopped the scanner from reading ${robotsBlocked} URL${robotsBlocked === 1 ? '' : 's'}; checks that needed them are unverified.`);
   }
-  if (checks.some((check) => check.status === 'error')) {
-    notes.push('Some checks could not finish (a timeout or a request limit); they are excluded from the score rather than counted as failures.');
+  if (checks.some((check) => check.status === 'unverified')) {
+    notes.push('Some checks could not be verified (a timeout, a blocked request or a scan limit); they are left out of the score rather than counted as failures.');
   }
+  const provisional = provisionalLimitation(overall);
+  if (provisional) notes.push(provisional);
   return notes;
 }

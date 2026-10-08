@@ -1,13 +1,14 @@
 import { createHash } from 'crypto';
+import { parse as parseDomain } from 'tldts';
 
 import { assertFetchableUrl } from '../transport/publicAddress';
 import type { ContentProfile } from '../report.types';
 
 /**
- * Turns a submitted URL into the docs scope a scan stays inside. Pure: no
- * network. `docs.example.com` keeps its host, `example.com/docs` keeps its
- * subtree, locale and version segments stay part of the root, and nothing is
- * ever widened to the whole registrable domain.
+ * Turns a submitted URL into the scope a scan stays inside: exactly the page
+ * or section that was submitted and everything under its path, as AFDocs
+ * scopes a run. Pure: no network. A scope is never widened to the whole site
+ * or moved to another host; only the entry URL's own redirects move it.
  */
 
 const TRACKING_PARAMS = new Set([
@@ -23,50 +24,6 @@ const TRACKING_PARAMS = new Set([
   'mkt_tok',
   'ref',
   'ref_src',
-]);
-
-const DOCS_ROOT_SEGMENTS = new Set([
-  'docs',
-  'doc',
-  'documentation',
-  'developers',
-  'developer',
-  'api',
-  'reference',
-  'guides',
-  'learn',
-  'manual',
-  'help',
-  'support',
-  'kb',
-  'knowledge-base',
-  'knowledgebase',
-  'hc',
-  'help-center',
-  'helpcenter',
-  'wiki',
-  'handbook',
-  'faq',
-]);
-
-const DOCS_HOST_LABELS = new Set([
-  'docs',
-  'doc',
-  'documentation',
-  'developer',
-  'developers',
-  'help',
-  'support',
-  'kb',
-  'knowledge',
-  'knowledgebase',
-  'learn',
-  'guide',
-  'guides',
-  'wiki',
-  'manual',
-  'faq',
-  'helpcenter',
 ]);
 
 const HELP_CENTER_HOST_LABELS = new Set([
@@ -103,8 +60,6 @@ export interface ScopeGuess {
   scopeRoot: URL;
   locale: string | null;
   version: string | null;
-  /** True for a bare apex such as `example.com`, where docs may live elsewhere. */
-  isApexRoot: boolean;
   /** The URL routed its content after `#/`, which agents cannot follow. */
   hashRouted: boolean;
 }
@@ -126,43 +81,23 @@ export function normalizeSubmittedUrl(input: string): URL {
   return url;
 }
 
+/** The submitted page or section, without its query or fragment, is the scope. */
 export function guessScope(entry: URL): ScopeGuess {
   const hashRouted = /^#!?\//.test(entry.hash);
   const entryUrl = new URL(entry.href);
   entryUrl.hash = '';
 
   const segments = entryUrl.pathname.split('/').filter(Boolean);
-  const docsHost = DOCS_HOST_LABELS.has(subdomainLabel(entryUrl.hostname) ?? '');
-
-  let rootLength = 0;
-  if (!docsHost) {
-    const docsIndex = segments.findIndex(
-      (segment, index) => index <= 1 && DOCS_ROOT_SEGMENTS.has(segment.toLowerCase()),
-    );
-    if (docsIndex >= 0) rootLength = docsIndex + 1;
-  }
-
-  let locale: string | null = null;
-  let version: string | null = null;
-  while (rootLength < segments.length) {
-    const segment = segments[rootLength];
-    if (!locale && LOCALE_SEGMENT.test(segment)) locale = segment;
-    else if (!version && VERSION_SEGMENT.test(segment)) version = segment;
-    else break;
-    rootLength++;
-  }
-
   const scopeRoot = new URL(entryUrl.origin);
-  scopeRoot.pathname = rootLength ? `/${segments.slice(0, rootLength).join('/')}` : '/';
+  scopeRoot.pathname = segments.length ? `/${segments.join('/')}` : '/';
 
-  const labels = entryUrl.hostname.split('.');
-  const isApexRoot =
-    !docsHost &&
-    rootLength === 0 &&
-    segments.length === 0 &&
-    (labels.length === 2 || (labels.length === 3 && labels[0] === 'www'));
-
-  return { entryUrl, scopeRoot, locale, version, isApexRoot, hashRouted };
+  return {
+    entryUrl,
+    scopeRoot,
+    locale: localeInPath(scopeRoot),
+    version: segments.find((segment) => VERSION_SEGMENT.test(segment)) ?? null,
+    hashRouted,
+  };
 }
 
 /** A locale code in the first three path segments, e.g. `en-us` in /hc/en-us/articles. */
@@ -177,18 +112,23 @@ export function isWithin(path: string, root: string): boolean {
   return base === '' || path === base || path.startsWith(`${base}/`);
 }
 
-/** The leftmost label of a subdomain (`docs` in docs.example.com); none for `example.com`. */
-function subdomainLabel(hostname: string): string | null {
-  const labels = hostname.split('.');
-  return labels.length >= 3 ? labels[0] : null;
+/** The first label left of the registrable domain: `help` in help.example.co.uk; none for `example.com`. */
+export function subdomainLabel(hostname: string): string | null {
+  const subdomain = parseDomain(hostname).subdomain;
+  return subdomain ? subdomain.split('.')[0] : null;
 }
 
-/** The last two labels of a host, so docs.example.com and example.com count as one site. */
+/**
+ * The registrable domain from the Public Suffix List, so docs.example.co.uk and
+ * example.co.uk count as one site while foo.readthedocs.io and
+ * bar.readthedocs.io stay two.
+ */
 export function baseDomain(hostname: string): string {
-  return hostname.replace(/^www\./, '').split('.').slice(-2).join('.');
+  const host = hostname.replace(/^www\./, '');
+  return parseDomain(host, { allowPrivateDomains: true }).domain ?? host;
 }
 
-/** `docs.example.com` or `example.com/docs`: the result page and badge key. */
+/** `docs.example.com` or `example.com/docs`: the site key reports and caches are stored under. */
 export function scopeKey(scopeRoot: URL): string {
   const host = scopeRoot.hostname.replace(/^www\./, '');
   const path = scopeRoot.pathname.replace(/\/+$/, '');
@@ -207,20 +147,6 @@ export function inferProfile(scopeRoot: URL): ContentProfile {
   const first = scopeRoot.pathname.split('/').filter(Boolean)[0]?.toLowerCase();
   if (first && HELP_CENTER_SEGMENTS.has(first)) return 'help-center';
   return 'developer-docs';
-}
-
-/** Where docs for a bare apex usually live, most likely first. */
-export function apexCandidates(apex: URL): string[] {
-  const host = apex.hostname.replace(/^www\./, '');
-  return [
-    `https://docs.${host}`,
-    `https://${host}/docs`,
-    `https://developers.${host}`,
-    `https://developer.${host}`,
-    `https://help.${host}`,
-    `https://support.${host}`,
-    `https://${host}/help`,
-  ];
 }
 
 export interface FingerprintInput {

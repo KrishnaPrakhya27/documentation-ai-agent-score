@@ -77,6 +77,9 @@ export const PLATFORM_PROFILES: PlatformProfile[] = [
       { kind: 'html', pattern: 'buildwithfern.com', weight: 3 },
       { kind: 'selector', pattern: '.fern-sidebar', weight: 3 },
       { kind: 'selector', pattern: '.fern-layout-main', weight: 2 },
+      { kind: 'selector', pattern: '#fern-sidebar', weight: 4 },
+      { kind: 'selector', pattern: '.fern-sidebar-desktop', weight: 2 },
+      { kind: 'html', pattern: 'fern-docs', weight: 2 },
     ],
   },
   {
@@ -194,7 +197,8 @@ const MIN_CONFIDENCE = 0.34;
 const DECISIVE_WEIGHT = 4;
 
 export interface PlatformEvidence {
-  pages: Array<{ url: string; html: string }>;
+  /** A page parsed already can hand over its root, so the HTML is not parsed twice. */
+  pages: Array<{ url: string; html: string; root?: HTMLElement }>;
 }
 
 export function detectPlatform(evidence: PlatformEvidence): PlatformResult {
@@ -204,7 +208,7 @@ export function detectPlatform(evidence: PlatformEvidence): PlatformResult {
   const parsed = pages.map((page) => ({
     url: page.url,
     html: page.html,
-    root: parse(page.html),
+    root: page.root ?? parse(page.html),
   }));
 
   let best: { profile: PlatformProfile; confidence: number } | null = null;

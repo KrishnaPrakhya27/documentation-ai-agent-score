@@ -10,7 +10,8 @@ import type { AgentScoreReport, ContentProfile } from './report.types';
 import { scanSite } from './scanSite';
 
 /**
- * `npx @documentation-ai/agent-score check <url>`: scans a docs site from this
+ * `npx tsx src/services/agent-score/cli.ts check <url>` (or, once published,
+ * `npx @documentation-ai/agent-score check <url>`): scans a docs site from this
  * machine and prints the report. Answerability runs only with --ai and that
  * provider's key in its usual environment variable. Nothing is uploaded.
  */
@@ -100,22 +101,39 @@ async function modelsFromFlags(flags: string[]) {
 }
 
 function summarize(report: AgentScoreReport, elapsedMs: number): string {
-  const { access, freshness } = report.pillars;
+  const { overall, afdocs, groups } = report;
   const lines = [
-    `${report.site.name} — ${report.target.key} (${report.platform.name}, ${report.target.profile})`,
-    `Access ${access.score ?? '—'}  (AFDocs ${access.afdocs?.passed}/${access.afdocs?.total}, ${access.afdocs?.score}/${access.afdocs?.grade})`,
-    `Freshness ${freshness.score ?? '—'}  ${freshness.components.map((c) => `${c.id}=${c.score ?? 'n/a'}`).join(' ')}`,
-    `Answerability ${report.pillars.answerability.score ?? '—'}  (${report.pillars.answerability.passed}/${report.pillars.answerability.total})  Overall ${report.overall.score ?? '—'} ${report.overall.grade ?? ''}`,
+    `${report.site.name}: ${report.target.key} (${report.platform.name}, ${report.target.profile})`,
+    ...(report.target.submittedUrl.replace(/\/+$/, '') !== report.target.scopeRoot.replace(/\/+$/, '')
+      ? [`Redirected from ${report.target.submittedUrl}`]
+      : []),
+    ...(report.coverage.rateLimitedRequests > 0
+      ? [`The site refused ${report.coverage.rateLimitedRequests} requests as too many; results may read low`]
+      : []),
+    `Score ${overall.score ?? 'n/a'} ${overall.grade ?? ''}${overall.provisional ? ' (provisional)' : ''}: ${overall.earned}/${overall.possible} points`,
+    ...(overall.cap ? [`Capped at ${overall.cap.value}: ${overall.cap.reason}`] : []),
+    ...(afdocs
+      ? [`AFDocs ${afdocs.score}/${afdocs.grade} (${afdocs.passed}/${afdocs.total} checks, ${afdocs.earned}/${afdocs.possible} points)`]
+      : []),
+    ...Object.values(groups).map(
+      (group) => `${group.label} ${group.score ?? 'n/a'}  (${group.earned}/${group.possible} points${group.note ? `; ${group.note}` : ''})`,
+    ),
     `Pages tested ${report.coverage.pagesTested}/${report.coverage.pagesDiscovered}, ${report.coverage.requests} requests, ${(elapsedMs / 1000).toFixed(1)}s`,
     '',
-    ...report.checks.map((check) => `${check.status.padEnd(5)} ${check.scored ? ' ' : '~'} ${check.id.padEnd(30)} ${check.message.slice(0, 100)}`),
+    ...report.checks.map(
+      (check) =>
+        `${check.status.padEnd(10)} ${String(check.points.earned ?? '-').padStart(4)}/${String(check.points.max).padEnd(4)} ${check.id.padEnd(30)} ${check.message.slice(0, 90)}`,
+    ),
+    ...report.additionalChecks.map(
+      (check) => `${check.status.padEnd(10)} ${'not scored'.padEnd(9)} ${check.id.padEnd(30)} ${check.message.slice(0, 90)}`,
+    ),
     '',
-    ...report.pillars.answerability.transcript.map(
+    ...report.answerability.transcript.map(
       (entry) => `Q [${entry.verdict}] ${entry.question}\n   → ${entry.answer.slice(0, 160).replace(/\s+/g, ' ')}\n   why: ${entry.reason}`,
     ),
     '',
     'Top fixes:',
-    ...report.topFixes.map((fix, index) => `${index + 1}. ${fix.title}: ${fix.fix.slice(0, 140)}`),
+    ...report.topFixes.map((fix, index) => `${index + 1}. ${fix.title} (+${fix.points} points): ${fix.fix.slice(0, 140)}`),
     '',
   ];
   return lines.join('\n');

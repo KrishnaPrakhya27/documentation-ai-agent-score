@@ -1,4 +1,5 @@
-import type { ReportCheck } from '../report.types';
+import type { AdditionalCheck } from '../report.types';
+import { baseDomain } from '../target/scope';
 import {
   fetchText,
   uniqueUrls,
@@ -8,13 +9,14 @@ import {
 
 /**
  * Newer agent interfaces a docs site can offer: llms-full.txt, an MCP server
- * and published agent skills. Informational in this methodology: presence is
- * reported with evidence but carries no points.
+ * and published agent skills. Reported outside the score, with evidence:
+ * their absence is not evidence of poor readiness, and adopting an optional
+ * protocol earns no points.
  */
 
 const JSON_OR_STREAM = 'application/json, text/event-stream';
 
-export async function checkLlmsFullTxt(input: BaseCheckInput): Promise<ReportCheck> {
+export async function checkLlmsFullTxt(input: BaseCheckInput): Promise<AdditionalCheck> {
   const candidates = uniqueUrls([
     `${input.target.scopeRoot}/llms-full.txt`,
     `${input.scopeRoot.origin}/llms-full.txt`,
@@ -40,23 +42,18 @@ export async function checkLlmsFullTxt(input: BaseCheckInput): Promise<ReportChe
   );
 }
 
-export async function checkMcpServer(input: CheckInput): Promise<ReportCheck> {
-  const advertised = (input.llmsTxt?.content.match(/https?:\/\/[^\s)<>"']+\/_?mcp\b/g) ?? []).slice(0, 2);
-  const candidates = uniqueUrls([
-    ...advertised,
-    `${input.target.scopeRoot}/mcp`,
-    `${input.target.scopeRoot}/_mcp`,
-    `${input.scopeRoot.origin}/mcp`,
-  ]);
+export async function checkMcpServer(input: CheckInput): Promise<AdditionalCheck> {
+  const found =
+    (await firstMcpEndpoint(input, [
+      ...advertisedMcpUrls(input.llmsTxt?.content ?? ''),
+      `${input.target.scopeRoot}/mcp`,
+      `${input.target.scopeRoot}/_mcp`,
+      `${input.scopeRoot.origin}/mcp`,
+    ])) ??
+    (await findServerCard(input)) ??
+    (await firstMcpEndpoint(input, mcpHostCandidates(input.scopeRoot.hostname)));
 
-  for (const url of candidates) {
-    const result = await fetchText(input, url, { accept: JSON_OR_STREAM });
-    if ('response' in result && looksLikeMcp(result.response.status, result.response.headers, result.body)) {
-      return protocolCheck('mcp-server', 'pass', `An MCP server answers at ${result.response.url}.`, [
-        result.response.url,
-      ]);
-    }
-  }
+  if (found) return protocolCheck('mcp-server', 'pass', found.message, [found.url]);
   return protocolCheck(
     'mcp-server',
     'fail',
@@ -66,7 +63,83 @@ export async function checkMcpServer(input: CheckInput): Promise<ReportCheck> {
   );
 }
 
-export async function checkAgentSkills(input: BaseCheckInput): Promise<ReportCheck> {
+interface FoundMcp {
+  url: string;
+  message: string;
+}
+
+async function firstMcpEndpoint(input: CheckInput, urls: string[]): Promise<FoundMcp | null> {
+  for (const url of uniqueUrls(urls)) {
+    const result = await fetchText(input, url, { accept: JSON_OR_STREAM });
+    if (!('response' in result)) continue;
+    const { response, body } = result;
+    const answer = mcpAnswer(new URL(response.url), response.status, response.headers, body);
+    if (answer === 'open') return { url: response.url, message: `An MCP server answers at ${response.url}.` };
+    if (answer === 'sign-in') {
+      return { url: response.url, message: `An MCP server answers at ${response.url}; agents need to sign in to use it.` };
+    }
+  }
+  return null;
+}
+
+/** An MCP server card at /.well-known/mcp/server-card.json, under the docs or the site root. */
+async function findServerCard(input: CheckInput): Promise<FoundMcp | null> {
+  for (const root of uniqueUrls([input.target.scopeRoot, input.scopeRoot.origin])) {
+    const result = await fetchText(input, `${root}/.well-known/mcp/server-card.json`, { accept: 'application/json' });
+    if ('response' in result && result.response.status === 200 && isServerCard(result.body)) {
+      return { url: result.response.url, message: `An MCP server is described at ${result.response.url}.` };
+    }
+  }
+  return null;
+}
+
+/** MCP endpoints named in llms.txt: an mcp. host, or a path ending in /mcp or /_mcp. */
+export function advertisedMcpUrls(llmsTxt: string): string[] {
+  return (llmsTxt.match(/https?:\/\/[^\s)<>"'`]+/g) ?? [])
+    .filter((link) => {
+      try {
+        const url = new URL(link);
+        return url.hostname.startsWith('mcp.') || /\/_?mcp\/?$/.test(url.pathname);
+      } catch {
+        return false;
+      }
+    })
+    .slice(0, 2);
+}
+
+/** Many companies run their MCP server on its own host, such as mcp.stripe.com. */
+function mcpHostCandidates(hostname: string): string[] {
+  const host = `mcp.${baseDomain(hostname)}`;
+  return [`https://${host}`, `https://${host}/mcp`];
+}
+
+/**
+ * How an endpoint answers a plain request: `open` when it speaks MCP, `sign-in`
+ * when it is an MCP server that wants credentials first, otherwise null.
+ */
+export function mcpAnswer(url: URL, status: number, headers: Headers, body: string): 'open' | 'sign-in' | null {
+  const type = headers.get('content-type') ?? '';
+  if (type.includes('text/event-stream')) return status === 200 ? 'open' : null;
+  const asksForToken = /bearer/i.test(headers.get('www-authenticate') ?? '');
+  if (status === 401 && (asksForToken || (type.includes('json') && url.hostname.startsWith('mcp.')))) {
+    return 'sign-in';
+  }
+  if (!type.includes('json')) return null;
+  if (status === 200) return /"(jsonrpc|capabilities|serverInfo|protocolVersion)"/.test(body) ? 'open' : null;
+  return [400, 405, 406].includes(status) && body.includes('"jsonrpc"') ? 'open' : null;
+}
+
+function isServerCard(body: string): boolean {
+  try {
+    const card = JSON.parse(body) as Record<string, unknown> | null;
+    if (!card || typeof card !== 'object' || Array.isArray(card)) return false;
+    return 'serverInfo' in card || ('name' in card && ['remotes', 'endpoints', 'transport', 'tools'].some((key) => key in card));
+  } catch {
+    return false;
+  }
+}
+
+export async function checkAgentSkills(input: BaseCheckInput): Promise<AdditionalCheck> {
   const roots = uniqueUrls([input.target.scopeRoot, input.scopeRoot.origin]);
   const candidates = roots.flatMap((root) => [
     `${root}/.well-known/agent-skills/index.json`,
@@ -95,14 +168,6 @@ export async function checkAgentSkills(input: BaseCheckInput): Promise<ReportChe
   );
 }
 
-function looksLikeMcp(status: number, headers: Headers, body: string): boolean {
-  const type = headers.get('content-type') ?? '';
-  if (type.includes('text/event-stream')) return status === 200;
-  if (!type.includes('json')) return false;
-  if (status === 200) return /"(jsonrpc|capabilities|serverInfo|protocolVersion)"/.test(body);
-  return [400, 405, 406].includes(status) && body.includes('"jsonrpc"');
-}
-
 function skillCount(body: string): number {
   try {
     const parsed = JSON.parse(body) as { skills?: unknown[] } | unknown[];
@@ -125,15 +190,11 @@ function protocolCheck(
   message: string,
   evidence: string[],
   fix?: string,
-): ReportCheck {
+): AdditionalCheck {
   return {
     id,
-    pillar: 'access',
-    group: 'agent-protocols',
     title: TITLES[id],
-    status: status === 'pass' ? 'pass' : 'info',
-    scored: false,
-    source: 'agent-score',
+    status: status === 'pass' ? 'found' : 'missing',
     message,
     ...(fix && { fix }),
     ...(evidence.length && { evidence }),

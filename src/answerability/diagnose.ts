@@ -1,6 +1,7 @@
 import type { AnswerVerdict } from '../report.types';
 import { containsQuote } from './sourcePages';
 import type { GeneratedQuestion, SolveOutcome, SourcePage } from './types';
+import { pageKey } from '../checks/pageContent';
 
 /**
  * Explains a verdict from what the agent actually fetched, so a failure says
@@ -75,17 +76,7 @@ export function diagnose(
 
 /** Same document, ignoring a trailing slash, a .md twin, query and fragment. */
 export function samePage(a: string, b: string): boolean {
-  return canonical(a) === canonical(b);
-}
-
-function canonical(url: string): string {
-  try {
-    const parsed = new URL(url);
-    const path = parsed.pathname.replace(/\/index\.mdx?$/, '').replace(/\.mdx?$/, '').replace(/\/+$/, '');
-    return `${parsed.hostname.replace(/^www\./, '')}${path}`;
-  } catch {
-    return url;
-  }
+  return pageKey(a) === pageKey(b);
 }
 
 function shortPath(url: string): string {

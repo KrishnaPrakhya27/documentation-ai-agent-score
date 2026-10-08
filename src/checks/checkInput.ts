@@ -2,6 +2,7 @@ import { classifyFetchError, type FetchFailureCode } from '../transport/errors';
 import type { ScanHttpClient, ScanResponse } from '../transport/guardedFetch';
 import type { RobotsPolicy } from '../transport/robotsPolicy';
 import type { ReportTarget } from '../report.types';
+import type { OpenApiSpec } from './openapi';
 import type { ParsedPage } from './pageContent';
 import type { ScopeSitemap } from './sitemapIndex';
 
@@ -16,6 +17,8 @@ export interface CheckInput {
   pages: ParsedPage[];
   llmsTxt: { url: string; content: string } | null;
   sitemap: Promise<ScopeSitemap>;
+  /** The published OpenAPI description, read once and shared by the checks that compare against it. */
+  openApi: Promise<OpenApiSpec | null>;
   now: number;
 }
 
@@ -46,6 +49,8 @@ export function unreadableBecause(outcome: FetchOutcome): string {
   switch (outcome.failure) {
     case 'robots':
       return 'robots.txt does not allow it';
+    case 'robots_unreachable':
+      return 'its robots.txt could not be read';
     case 'deadline':
     case 'budget':
       return 'the scan reached its time or request limit first';

@@ -4,6 +4,7 @@ import { BlockedTargetError } from './publicAddress';
 export type FetchFailureCode =
   | 'blocked'
   | 'robots'
+  | 'robots_unreachable'
   | 'budget'
   | 'deadline'
   | 'timeout'
@@ -14,8 +15,16 @@ export type FetchFailureCode =
   | 'other';
 
 export class RobotsDisallowedError extends Error {
-  constructor(readonly url: string) {
-    super(`robots.txt does not allow the scanner to fetch ${url}`);
+  /** `unreachable` means the site's rules could not be read (server error, 429 or a failed request), not that they forbid the page. */
+  constructor(
+    readonly url: string,
+    readonly state: 'ok' | 'unreachable' = 'ok',
+  ) {
+    super(
+      state === 'unreachable'
+        ? `robots.txt could not be read, so the scanner did not fetch ${url}`
+        : `robots.txt does not allow the scanner to fetch ${url}`,
+    );
     this.name = 'RobotsDisallowedError';
   }
 }
@@ -43,7 +52,9 @@ export class TooManyRedirectsError extends Error {
 
 export function classifyFetchError(error: unknown): FetchFailureCode {
   if (error instanceof BlockedTargetError) return 'blocked';
-  if (error instanceof RobotsDisallowedError) return 'robots';
+  if (error instanceof RobotsDisallowedError) {
+    return error.state === 'unreachable' ? 'robots_unreachable' : 'robots';
+  }
   if (error instanceof RequestBudgetError) return 'budget';
   if (error instanceof ScanDeadlineError) return 'deadline';
   if (error instanceof TooManyRedirectsError) return 'redirects';
@@ -53,8 +64,16 @@ export function classifyFetchError(error: unknown): FetchFailureCode {
   const code = cause.code ?? err?.code ?? '';
   if (cause instanceof BlockedTargetError) return 'blocked';
   if (err?.name === 'TimeoutError' || err?.name === 'AbortError') return 'timeout';
+  if (code === 'UND_ERR_HEADERS_TIMEOUT' || code === 'UND_ERR_BODY_TIMEOUT') return 'timeout';
   if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'dns';
-  if (code.startsWith('ERR_TLS') || code.includes('CERT')) return 'tls';
+  if (
+    code.startsWith('ERR_TLS') ||
+    code.includes('CERT') ||
+    code.includes('SELF_SIGNED') ||
+    code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE'
+  ) {
+    return 'tls';
+  }
   if (
     code === 'ECONNREFUSED' ||
     code === 'ECONNRESET' ||

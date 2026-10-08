@@ -1,105 +1,161 @@
-import { parse as parseYaml } from 'yaml';
+import { parse } from 'node-html-parser';
 
 import { classifyFetchError } from '../transport/errors';
 import type { ReportCheck } from '../report.types';
-import { fetchText, unreadableBecause, type CheckInput } from './checkInput';
-import { contentLinks, datesIn, declaredUpdateDate, toDate } from './pageContent';
+import type { CheckInput } from './checkInput';
+import { endpointMentions, specOperation, type EndpointMention } from './openapi';
+import { ourCheck, statusForCredit } from './ourCheck';
+import {
+  anchorIds,
+  contentReferences,
+  declaredUpdateDate,
+  pageKey,
+  toDate,
+  type ParsedPage,
+} from './pageContent';
+import { pickEvenly } from './sitemapIndex';
 
 /**
- * Freshness and integrity: broken links, declared update dates, changelog
- * recency and endpoints the docs mention that the OpenAPI file lacks. An old
- * date alone never fails a page; a missing signal is reported as missing.
+ * Freshness: whether the docs are maintained and consistent with their
+ * sources. Maintenance is what a scan can see on its own (dates, links and
+ * anchors, the sitemap); consistency and currency compare the docs with the
+ * published API spec, and only count when a spec exists. A check that could
+ * not run says so instead of scoring zero.
  */
 
-export interface ScoredCheck {
-  check: ReportCheck;
-  /** 0-100, or null when the check does not apply to this site. */
-  score: number | null;
+const LINK_LIMITS = { internal: 30, external: 15, perHost: 3, hosts: 8, anchors: 15, sitemap: 10 };
+const SKIPPED_EXTENSIONS = /\.(png|jpe?g|gif|svg|webp|ico|zip|gz|tgz|mp4|mov|woff2?)$/i;
+/** Enough of a page to read its ids without downloading a whole reference page. */
+const ANCHOR_PAGE_BYTES = 512 * 1024;
+/** Fragments that are not section ids: hash routing and text fragments. */
+const NOT_A_SECTION = /^([/!?]|:~:)/;
+
+interface Verdict {
+  state: 'ok' | 'broken' | 'unverified';
+  detail: string;
 }
 
-const DAY_MS = 86_400_000;
-const LINK_LIMITS = { internal: 30, external: 15, perHost: 3, hosts: 8 };
-const SKIPPED_EXTENSIONS = /\.(png|jpe?g|gif|svg|webp|ico|zip|gz|tgz|mp4|mov|woff2?)$/i;
+interface Reference {
+  url: string;
+  fragment: string | null;
+  from: string;
+}
 
-type LinkVerdict = 'ok' | 'broken' | 'unverified';
-
-export async function checkBrokenLinks(input: CheckInput): Promise<ScoredCheck> {
-  const sources = new Map<string, string>();
-  for (const page of input.pages) {
-    for (const link of contentLinks(page)) {
-      if (!sources.has(link) && !SKIPPED_EXTENSIONS.test(new URL(link).pathname)) {
-        sources.set(link, page.url);
-      }
-    }
+export async function checkLinksAndAnchors(input: CheckInput): Promise<ReportCheck> {
+  const references = collectReferences(input.pages);
+  if (references.length === 0) {
+    return ourCheck('links-and-anchors', 'skip', null, 'The sampled pages carry no links to check.');
   }
 
-  const known = new Set(input.pages.map((page) => page.url));
+  const known = new Map(input.pages.map((page) => [pageKey(page.url), page]));
+  const linkTargets = chooseLinkTargets(references, input.scopeRoot.origin);
+  const linkVerdicts = new Map<string, Verdict>();
+  await Promise.all(
+    linkTargets.map(async (url) => {
+      linkVerdicts.set(url, known.has(pageKey(url)) ? { state: 'ok', detail: 'sampled page' } : await checkLink(input, url));
+    }),
+  );
+
+  const anchorRefs = references
+    .filter((reference) => reference.fragment && !NOT_A_SECTION.test(reference.fragment))
+    .filter((reference) => new URL(reference.url).origin === input.scopeRoot.origin)
+    .slice(0, LINK_LIMITS.anchors);
+  const anchorCache = new Map<string, Promise<Set<string> | Verdict>>();
+  const anchorVerdicts = await Promise.all(
+    anchorRefs.map(async (reference) => ({
+      reference,
+      verdict: await checkAnchor(input, reference, known, linkVerdicts, anchorCache),
+    })),
+  );
+
+  const links = linkTargets.map((url) => ({ label: url, from: sourceOf(references, url), verdict: linkVerdicts.get(url) as Verdict }));
+  const anchors = anchorVerdicts.map(({ reference, verdict }) => ({
+    label: `${reference.url}#${reference.fragment}`,
+    from: reference.from,
+    verdict,
+  }));
+  const all = [...links, ...anchors];
+  const checked = all.filter((entry) => entry.verdict.state !== 'unverified');
+  const broken = checked.filter((entry) => entry.verdict.state === 'broken');
+  const unverified = all.length - checked.length;
+
+  if (checked.length === 0) {
+    return ourCheck(
+      'links-and-anchors',
+      'unverified',
+      null,
+      `None of the ${all.length} links on the sampled pages could be verified (timeouts, blocked requests or the scan's limits).`,
+    );
+  }
+
+  const credit = (checked.length - broken.length) / checked.length;
+  const rate = broken.length / checked.length;
+  const brokenLinks = broken.filter((entry) => links.includes(entry)).length;
+  const brokenAnchors = broken.length - brokenLinks;
+  const unverifiedNote = unverified
+    ? ` ${unverified} more could not be verified (timeouts or blocked requests) and ${unverified === 1 ? 'is' : 'are'} not counted.`
+    : '';
+  const anchorsChecked = anchors.filter((entry) => entry.verdict.state !== 'unverified').length;
+  const linksChecked = checked.length - anchorsChecked;
+
+  return ourCheck(
+    'links-and-anchors',
+    broken.length === 0 ? 'pass' : rate <= 0.05 ? 'warn' : 'fail',
+    credit,
+    broken.length === 0
+      ? `All ${linksChecked} links${anchorsChecked ? ` and ${anchorsChecked} section anchors` : ''} checked on the sampled pages work.${unverifiedNote}`
+      : `${broken.length} of ${checked.length} references checked on the sampled pages are broken: ${brokenLinks} link${brokenLinks === 1 ? '' : 's'}${brokenAnchors ? ` and ${brokenAnchors} section anchor${brokenAnchors === 1 ? '' : 's'}` : ''}.${unverifiedNote}`,
+    broken.length
+      ? 'Fix or remove the broken links, redirect moved pages to their new address, and restore or retarget section anchors. Agents follow links to gather context, and a dead link ends that path.'
+      : undefined,
+    broken.slice(0, 5).map((entry) => `${entry.label} (${entry.verdict.detail}) linked from ${entry.from}`),
+  );
+}
+
+function collectReferences(pages: ParsedPage[]): Reference[] {
+  const seen = new Set<string>();
+  const references: Reference[] = [];
+  for (const page of pages) {
+    for (const reference of contentReferences(page)) {
+      if (SKIPPED_EXTENSIONS.test(new URL(reference.url).pathname)) continue;
+      const key = `${reference.url}#${reference.fragment ?? ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      references.push({ ...reference, from: page.url });
+    }
+  }
+  return references;
+}
+
+/** Up to 30 links on the site and 15 elsewhere, spread across hosts, in the order found. */
+function chooseLinkTargets(references: Reference[], origin: string): string[] {
   const internal: string[] = [];
   const external: string[] = [];
   const perHost = new Map<string, number>();
-  for (const link of sources.keys()) {
-    const url = new URL(link);
-    if (url.origin === input.scopeRoot.origin) {
-      if (internal.length < LINK_LIMITS.internal) internal.push(link);
+  for (const url of [...new Set(references.map((reference) => reference.url))]) {
+    const parsed = new URL(url);
+    if (parsed.origin === origin) {
+      if (internal.length < LINK_LIMITS.internal) internal.push(url);
       continue;
     }
-    const count = perHost.get(url.host) ?? 0;
+    const count = perHost.get(parsed.host) ?? 0;
     if (
       external.length < LINK_LIMITS.external &&
       count < LINK_LIMITS.perHost &&
       (count > 0 || perHost.size < LINK_LIMITS.hosts)
     ) {
-      perHost.set(url.host, count + 1);
-      external.push(link);
+      perHost.set(parsed.host, count + 1);
+      external.push(url);
     }
   }
-
-  const verdicts = await Promise.all(
-    [...internal, ...external].map(async (link) => ({
-      link,
-      verdict: known.has(link)
-        ? { state: 'ok' as const, detail: 'sampled page' }
-        : await checkLink(input, link),
-    })),
-  );
-  const broken = verdicts.filter((entry) => entry.verdict.state === 'broken');
-  const checked = verdicts.filter((entry) => entry.verdict.state !== 'unverified');
-
-  if (checked.length === 0) {
-    return {
-      score: null,
-      check: freshnessCheck('broken-links', 'link-health', 'skip', 'No links on the sampled pages could be checked.'),
-    };
-  }
-
-  const score = Math.round(((checked.length - broken.length) / checked.length) * 100);
-  const rate = broken.length / checked.length;
-  const status = broken.length === 0 ? 'pass' : rate <= 0.05 ? 'warn' : 'fail';
-  const evidence = broken
-    .slice(0, 5)
-    .map((entry) => `${entry.link} (${entry.verdict.detail}) — linked from ${sources.get(entry.link)}`);
-
-  return {
-    score,
-    check: freshnessCheck(
-      'broken-links',
-      'link-health',
-      status,
-      broken.length === 0
-        ? `All ${checked.length} links checked on the sampled pages work.`
-        : `${broken.length} of ${checked.length} links checked on the sampled pages are broken.`,
-      broken.length
-        ? 'Fix or remove the broken links, and redirect moved pages to their new address. Agents follow links to gather context, and a dead link ends that path.'
-        : undefined,
-      evidence,
-    ),
-  };
+  return [...internal, ...external];
 }
 
-async function checkLink(
-  input: CheckInput,
-  link: string,
-): Promise<{ state: LinkVerdict; detail: string }> {
+function sourceOf(references: Reference[], url: string): string {
+  return references.find((reference) => reference.url === url)?.from ?? url;
+}
+
+async function checkLink(input: Pick<CheckInput, 'http'>, link: string): Promise<Verdict> {
   try {
     let response = await input.http.fetch(link, { method: 'HEAD' });
     // Some servers mishandle HEAD, so a 404 is confirmed with a GET too.
@@ -119,325 +175,199 @@ async function checkLink(
   }
 }
 
-export async function checkUpdateDates(input: CheckInput): Promise<ScoredCheck> {
+/** Whether the section a `#fragment` names exists on its page: a sampled page, or one read for the purpose. */
+async function checkAnchor(
+  input: CheckInput,
+  reference: Reference,
+  known: Map<string, ParsedPage>,
+  linkVerdicts: Map<string, Verdict>,
+  cache: Map<string, Promise<Set<string> | Verdict>>,
+): Promise<Verdict> {
+  const fragment = reference.fragment as string;
+  if (fragment === 'top') return { state: 'ok', detail: 'top of page' };
+
+  const sampled = known.get(pageKey(reference.url));
+  const ids = sampled ? sampled.anchors : await anchorsOf(input, reference.url, linkVerdicts, cache);
+  if (!(ids instanceof Set)) return ids;
+  return ids.has(fragment)
+    ? { state: 'ok', detail: 'section found' }
+    : { state: 'broken', detail: 'no such section' };
+}
+
+async function anchorsOf(
+  input: CheckInput,
+  url: string,
+  linkVerdicts: Map<string, Verdict>,
+  cache: Map<string, Promise<Set<string> | Verdict>>,
+): Promise<Set<string> | Verdict> {
+  const linkVerdict = linkVerdicts.get(url);
+  if (linkVerdict && linkVerdict.state !== 'ok') return linkVerdict;
+  let pending = cache.get(url);
+  if (!pending) {
+    pending = (async () => {
+      try {
+        const response = await input.http.fetch(url, { maxBytes: ANCHOR_PAGE_BYTES });
+        if (response.status === 404 || response.status === 410) return { state: 'broken', detail: String(response.status) } as Verdict;
+        if (response.status >= 400) return { state: 'unverified', detail: String(response.status) } as Verdict;
+        return anchorIds(parse(await response.text()));
+      } catch (error) {
+        return { state: 'unverified', detail: classifyFetchError(error) } as Verdict;
+      }
+    })();
+    cache.set(url, pending);
+  }
+  return pending;
+}
+
+export async function checkUpdateInfo(input: CheckInput): Promise<ReportCheck> {
   if (input.pages.length === 0) {
-    return {
-      score: null,
-      check: freshnessCheck('last-updated-dates', 'recency', 'skip', 'No pages could be read.'),
-    };
+    return ourCheck('update-info', 'skip', null, 'No pages could be read.');
   }
 
   const sitemap = await input.sitemap;
-  const lastmods = new Map(sitemap.inScope.map((entry) => [withoutSlash(entry.loc), entry.lastmod]));
-  const onPage: number[] = [];
-  const inSitemapOnly: number[] = [];
+  const lastmods = new Map(sitemap.inScope.map((entry) => [pageKey(entry.loc), entry.lastmod]));
+  let onPage = 0;
+  let inSitemapOnly = 0;
   for (const page of input.pages) {
-    const declared = declaredUpdateDate(page);
-    const fallback = declared ? null : toDate(lastmods.get(withoutSlash(page.url)));
-    const date = declared ?? fallback;
-    if (!date) continue;
-    const age = Math.max(0, (input.now - date.getTime()) / DAY_MS);
-    (declared ? onPage : inSitemapOnly).push(age);
+    if (declaredUpdateDate(page)) onPage++;
+    else if (toDate(lastmods.get(pageKey(page.url)))) inSitemapOnly++;
   }
 
-  const ages = [...onPage, ...inSitemapOnly].sort((a, b) => a - b);
-  const credit = (onPage.length + inSitemapOnly.length * 0.5) / input.pages.length;
-  const median = ages.length ? ages[Math.floor(ages.length / 2)] : null;
-  const agePenalty = median === null ? 1 : median <= 365 ? 1 : median <= 730 ? 0.85 : 0.7;
-  const score = Math.round(credit * 100 * agePenalty);
-  const status = score >= 80 ? 'pass' : score >= 50 ? 'warn' : 'fail';
-
-  const sitemapText = inSitemapOnly.length
-    ? `; ${inSitemapOnly.length} more ha${inSitemapOnly.length === 1 ? 's' : 've'} a date only in the sitemap`
+  const credit = (onPage + inSitemapOnly * 0.5) / input.pages.length;
+  const sitemapText = inSitemapOnly
+    ? `, and ${inSitemapOnly} more ha${inSitemapOnly === 1 ? 's' : 've'} a date only in the sitemap`
     : '';
-  const ageText = median === null ? '' : ` (median ${describeAge(median)})`;
-  return {
-    score,
-    check: freshnessCheck(
-      'last-updated-dates',
-      'recency',
-      status,
-      `${onPage.length} of ${input.pages.length} sampled pages show when they were last updated${sitemapText}${ageText}.`,
-      status === 'pass'
-        ? undefined
-        : 'Show a last-updated date on every page and publish it as article:modified_time or dateModified, so agents can tell current guidance from old guidance.',
-    ),
-  };
-}
-
-function withoutSlash(url: string): string {
-  return url.split('#')[0].replace(/\/+$/, '');
-}
-
-const CHANGELOG_PATH =
-  /\/(changelog|change-log|release-notes|releasenotes|releases|whats-new|what-s-new|updates|release-history)(\/|$|\.)/i;
-
-export async function checkChangelog(input: CheckInput): Promise<ScoredCheck> {
-  const candidate = findChangelog(input);
-  if (!candidate) {
-    return {
-      score: null,
-      check: freshnessCheck(
-        'changelog-recency',
-        'recency',
-        'skip',
-        'No changelog or release notes were linked from the docs, so recency was not scored.',
-        'Publish a dated changelog and link it from your docs navigation and llms.txt, so agents can see what changed and when.',
-      ),
-    };
-  }
-
-  const result = await fetchText(input, candidate);
-  if (!('response' in result) || result.response.status !== 200) {
-    return {
-      score: null,
-      check: freshnessCheck(
-        'changelog-recency',
-        'recency',
-        'skip',
-        `The changelog at ${candidate} could not be read because ${unreadableBecause(result)}.`,
-      ),
-    };
-  }
-
-  const text = result.body.replace(/<[^>]+>/g, ' ');
-  const newest = datesIn(text, input.now)[0];
-  if (!newest) {
-    return {
-      score: 40,
-      check: freshnessCheck(
-        'changelog-recency',
-        'recency',
-        'warn',
-        `The changelog at ${result.response.url} has no dates an agent can read.`,
-        'Put a date on every changelog entry, in the text of the page.',
-        [result.response.url],
-      ),
-    };
-  }
-
-  const ageDays = (input.now - newest.getTime()) / DAY_MS;
-  const status = ageDays <= 90 ? 'pass' : ageDays <= 365 ? 'warn' : 'fail';
-  return {
-    score: status === 'pass' ? 100 : status === 'warn' ? 60 : 20,
-    check: freshnessCheck(
-      'changelog-recency',
-      'recency',
-      status,
-      `The latest changelog entry is from ${newest.toISOString().slice(0, 10)} (${describeAge(ageDays)}).`,
-      status === 'pass'
-        ? undefined
-        : 'Keep the changelog current. An old last entry makes agents doubt whether the rest of the docs still apply.',
-      [result.response.url],
-    ),
-  };
-}
-
-function findChangelog(input: CheckInput): string | null {
-  const baseHost = input.scopeRoot.hostname.split('.').slice(-2).join('.');
-  const links = new Set<string>();
-  for (const page of input.pages) {
-    for (const anchor of page.root.querySelectorAll('a[href]')) {
-      try {
-        links.add(new URL(anchor.getAttribute('href') ?? '', page.url).href.split('#')[0]);
-      } catch {
-        // ignore unparseable links
-      }
-    }
-  }
-  for (const match of input.llmsTxt?.content.matchAll(/\((https?:\/\/[^)\s]+)\)/g) ?? []) {
-    links.add(match[1]);
-  }
-
-  return (
-    [...links]
-      .filter((link) => {
-        const url = new URL(link);
-        return (
-          (url.hostname === baseHost || url.hostname.endsWith(`.${baseHost}`)) &&
-          CHANGELOG_PATH.test(url.pathname)
-        );
-      })
-      .sort((a, b) => changelogRank(a) - changelogRank(b) || a.length - b.length)[0] ?? null
+  return ourCheck(
+    'update-info',
+    statusForCredit(credit, { pass: 0.8, warn: 0.5 }),
+    credit,
+    `${onPage} of ${input.pages.length} sampled pages state when they were last changed${sitemapText}.`,
+    credit >= 0.8
+      ? undefined
+      : 'Publish a last-modified date on every page: as article:modified_time or dateModified in the page, a visible "Last updated" line, or a Last-Modified header. Agents can then tell how current a page is; the date itself is not judged.',
   );
 }
 
-function changelogRank(link: string): number {
-  if (/changelog|change-log/i.test(link)) return 0;
-  if (/release-notes|releasenotes/i.test(link)) return 1;
-  return 2;
+export async function checkSitemapLive(input: CheckInput): Promise<ReportCheck> {
+  const sitemap = await input.sitemap;
+  if (!sitemap.url || sitemap.inScope.length === 0) {
+    return ourCheck('sitemap-live', 'skip', null, 'No sitemap entries for these docs to check.');
+  }
+
+  const sampled = new Set(input.pages.map((page) => pageKey(page.url)));
+  const candidates = pickEvenly(
+    sitemap.inScope.map((entry) => entry.loc).filter((loc) => !sampled.has(pageKey(loc))),
+    LINK_LIMITS.sitemap,
+  );
+  if (candidates.length === 0) {
+    return ourCheck('sitemap-live', 'pass', 1, 'Every sitemap entry for these docs is a page the scan read.');
+  }
+
+  const verdicts = await Promise.all(candidates.map(async (url) => ({ url, verdict: await checkLink(input, url) })));
+  const verified = verdicts.filter((entry) => entry.verdict.state !== 'unverified');
+  if (verified.length === 0) {
+    return ourCheck(
+      'sitemap-live',
+      'unverified',
+      null,
+      `None of the ${candidates.length} sitemap entries sampled could be verified (timeouts, blocked requests or the scan's limits).`,
+    );
+  }
+  const dead = verified.filter((entry) => entry.verdict.state === 'broken');
+  const credit = (verified.length - dead.length) / verified.length;
+  return ourCheck(
+    'sitemap-live',
+    dead.length === 0 ? 'pass' : credit >= 0.9 ? 'warn' : 'fail',
+    credit,
+    dead.length === 0
+      ? `All ${verified.length} sitemap entries sampled still exist.`
+      : `${dead.length} of ${verified.length} sitemap entries sampled no longer exist.`,
+    dead.length
+      ? 'Remove deleted pages from the sitemap, or redirect them. A sitemap that lists missing pages sends agents and crawlers to errors.'
+      : undefined,
+    dead.slice(0, 5).map((entry) => `${entry.url} (${entry.verdict.detail})`),
+  );
 }
 
-export async function checkOpenApiDrift(input: CheckInput): Promise<ScoredCheck> {
-  const mentions = endpointMentions(input);
-  const spec = await loadOpenApi(input);
-
+export async function checkApiSpecMatch(input: CheckInput): Promise<ReportCheck> {
+  const spec = await input.openApi;
   if (!spec) {
-    return {
-      score: null,
-      check: freshnessCheck('openapi-drift', 'recency', 'skip', 'No OpenAPI description was found, so endpoint coverage was not checked.'),
-    };
+    return ourCheck('api-spec-match', 'skip', null, 'No OpenAPI description was found, so the docs could not be compared with a spec.');
   }
-  if (mentions.size === 0) {
-    return {
-      score: null,
-      check: freshnessCheck(
-        'openapi-drift',
-        'recency',
-        'skip',
-        `Found ${spec.url}, but the sampled pages mention no endpoints to compare against it.`,
-        undefined,
-        [spec.url],
-      ),
-    };
+  const mentioned = [...new Set(endpointMentions(input.pages).map((mention) => mention.operation))];
+  if (mentioned.length === 0) {
+    return ourCheck(
+      'api-spec-match',
+      'skip',
+      null,
+      `Found ${spec.url}, but the sampled pages mention no endpoints to compare against it.`,
+      undefined,
+      [spec.url],
+    );
   }
 
-  const missing = [...mentions].filter((mention) => !specHas(spec, mention));
-  const score = Math.max(0, 100 - missing.length * 15);
-  const status = missing.length === 0 ? 'pass' : missing.length <= 2 ? 'warn' : 'fail';
-  return {
-    score,
-    check: freshnessCheck(
-      'openapi-drift',
-      'recency',
-      status,
-      missing.length === 0
-        ? `All ${mentions.size} endpoints mentioned on the sampled pages are in ${spec.url}.`
-        : `${missing.length} of ${mentions.size} endpoints mentioned in the docs are not in ${spec.url}.`,
-      missing.length
-        ? 'Update either the docs or the OpenAPI file so they describe the same endpoints. Agents trust the spec when generating code, and a mismatch produces calls that fail.'
-        : undefined,
-      [spec.url, ...missing.slice(0, 5)],
-    ),
-  };
-}
-
-interface OpenApiSpec {
-  url: string;
-  operations: Set<string>;
-  basePaths: string[];
-}
-
-const METHODS = ['get', 'post', 'put', 'patch', 'delete'];
-const MENTION = /\b(GET|POST|PUT|PATCH|DELETE)\s+(\/[A-Za-z0-9_\-./{}:<>]+)/g;
-
-function endpointMentions(input: CheckInput): Set<string> {
-  const mentions = new Set<string>();
-  for (const page of input.pages) {
-    for (const match of page.text.matchAll(MENTION)) {
-      mentions.add(`${match[1]} ${normalizeApiPath(match[2])}`);
-    }
-  }
-  return mentions;
-}
-
-function normalizeApiPath(path: string): string {
-  return (
-    path
-      .replace(/[.,;:)]+$/, '')
-      .replace(/\{[^}]*\}|<[^>]*>|:[A-Za-z_]\w*/g, '{}')
-      .replace(/\/+$/, '') || '/'
+  const missing = mentioned.filter((operation) => specOperation(spec, operation) === null);
+  const credit = (mentioned.length - missing.length) / mentioned.length;
+  return ourCheck(
+    'api-spec-match',
+    statusForCredit(credit, { pass: 1, warn: 0.8 }),
+    credit,
+    missing.length === 0
+      ? `All ${mentioned.length} endpoints mentioned on the sampled pages are in ${spec.url}.`
+      : `${missing.length} of ${mentioned.length} endpoints mentioned in the docs are not in ${spec.url}.`,
+    missing.length
+      ? 'Update either the docs or the OpenAPI file so they describe the same endpoints. Agents trust the spec when generating code, and a mismatch produces calls that fail.'
+      : undefined,
+    [spec.url, ...missing.slice(0, 5)],
   );
 }
 
-function specHas(spec: OpenApiSpec, mention: string): boolean {
-  if (spec.operations.has(mention)) return true;
-  const [method, path] = mention.split(' ');
-  return spec.basePaths.some(
-    (base) => base && path.startsWith(`${base}/`) && spec.operations.has(`${method} ${path.slice(base.length)}`),
+const DEPRECATION_NOTICE =
+  /deprecat|no longer (?:supported|available|recommended|maintained)|sunset|retired|legacy|will be removed|use [^.]{0,60} instead/i;
+
+export async function checkDeprecationNotices(input: CheckInput): Promise<ReportCheck> {
+  const spec = await input.openApi;
+  if (!spec) {
+    return ourCheck('deprecation-notices', 'skip', null, 'No OpenAPI description was found, so deprecation notices could not be compared with a spec.');
+  }
+  if (spec.deprecated.size === 0) {
+    return ourCheck('deprecation-notices', 'skip', null, `${spec.url} marks no operation as deprecated, so there is nothing to compare.`, undefined, [spec.url]);
+  }
+
+  const uses = new Map<string, EndpointMention & { spec: string }>();
+  for (const mention of endpointMentions(input.pages)) {
+    const operation = specOperation(spec, mention.operation);
+    if (!operation || !spec.deprecated.has(operation)) continue;
+    const key = `${mention.page} ${operation}`;
+    const existing = uses.get(key);
+    // Keep the mention whose surroundings carry the notice, if any does.
+    if (!existing || (!DEPRECATION_NOTICE.test(existing.context) && DEPRECATION_NOTICE.test(mention.context))) {
+      uses.set(key, { ...mention, spec: operation });
+    }
+  }
+  if (uses.size === 0) {
+    return ourCheck(
+      'deprecation-notices',
+      'skip',
+      null,
+      `The sampled pages do not use any of the ${spec.deprecated.size} operations ${spec.url} marks deprecated.`,
+      undefined,
+      [spec.url],
+    );
+  }
+
+  const silent = [...uses.values()].filter((use) => !DEPRECATION_NOTICE.test(use.context));
+  const credit = (uses.size - silent.length) / uses.size;
+  return ourCheck(
+    'deprecation-notices',
+    statusForCredit(credit, { pass: 1, warn: 0.5 }),
+    credit,
+    silent.length === 0
+      ? `All ${uses.size} uses of deprecated operations on the sampled pages say the operation is deprecated.`
+      : `${silent.length} of ${uses.size} uses of deprecated operations on the sampled pages do not say so.`,
+    silent.length
+      ? 'Where the docs use an operation the spec marks deprecated, say it is deprecated next to it and point to the replacement, so an agent does not recommend it.'
+      : undefined,
+    silent.slice(0, 5).map((use) => `${use.spec} on ${use.page}`),
   );
-}
-
-async function loadOpenApi(input: CheckInput): Promise<OpenApiSpec | null> {
-  const linked = new Set<string>();
-  const specLink = /https?:\/\/[^\s)"'<>]+(?:openapi|swagger)[^\s)"'<>/]*\.(?:json|ya?ml)\b/gi;
-  for (const match of input.llmsTxt?.content.matchAll(specLink) ?? []) linked.add(match[0]);
-  for (const page of input.pages) {
-    for (const link of contentLinks(page)) {
-      if (/(openapi|swagger)[^/]*\.(json|ya?ml)$/i.test(link)) linked.add(link);
-    }
-  }
-  const candidates = [
-    ...linked,
-    `${input.target.scopeRoot}/openapi.json`,
-    `${input.target.scopeRoot}/api-reference/openapi.json`,
-    `${input.scopeRoot.origin}/openapi.json`,
-  ].slice(0, 5);
-
-  for (const url of [...new Set(candidates)]) {
-    const result = await fetchText(input, url, {
-      accept: 'application/json, application/yaml, text/yaml',
-    });
-    if (!('response' in result) || result.response.status !== 200 || result.response.truncated) {
-      continue;
-    }
-    const spec = parseSpec(result.body);
-    if (spec) return { url: result.response.url, ...spec };
-  }
-  return null;
-}
-
-function parseSpec(body: string): Omit<OpenApiSpec, 'url'> | null {
-  let document: { paths?: Record<string, Record<string, unknown>>; servers?: Array<{ url?: string }> };
-  try {
-    document = body.trimStart().startsWith('{') ? JSON.parse(body) : parseYaml(body);
-  } catch {
-    return null;
-  }
-  if (!document || typeof document !== 'object' || !document.paths) return null;
-
-  const operations = new Set<string>();
-  for (const [path, item] of Object.entries(document.paths)) {
-    for (const method of METHODS) {
-      if (item && typeof item === 'object' && method in item) {
-        operations.add(`${method.toUpperCase()} ${normalizeApiPath(path)}`);
-      }
-    }
-  }
-  const basePaths = (document.servers ?? [])
-    .map((server) => {
-      try {
-        return new URL(server.url ?? '', 'https://placeholder.invalid').pathname.replace(/\/+$/, '');
-      } catch {
-        return '';
-      }
-    })
-    .filter(Boolean);
-  return operations.size ? { operations, basePaths } : null;
-}
-
-function describeAge(days: number): string {
-  if (days < 1) return 'today';
-  if (days < 45) return `${Math.round(days)} days ago`;
-  if (days < 540) return `${Math.round(days / 30)} months ago`;
-  return `${(days / 365).toFixed(1)} years ago`;
-}
-
-const TITLES: Record<string, string> = {
-  'broken-links': 'Links on the page work',
-  'last-updated-dates': 'Pages show when they were last updated',
-  'changelog-recency': 'Changelog is recent',
-  'openapi-drift': 'Docs match the OpenAPI file',
-};
-
-function freshnessCheck(
-  id: string,
-  group: 'link-health' | 'recency',
-  status: ReportCheck['status'],
-  message: string,
-  fix?: string,
-  evidence?: string[],
-): ReportCheck {
-  return {
-    id,
-    pillar: 'freshness',
-    group,
-    title: TITLES[id],
-    status,
-    scored: status !== 'skip',
-    source: 'agent-score',
-    message,
-    ...(fix && { fix }),
-    ...(evidence?.length && { evidence }),
-  };
 }

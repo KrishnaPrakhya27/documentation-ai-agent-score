@@ -10,15 +10,15 @@ Needs Node.js 22 or later. The scan runs from your machine and nothing is upload
 
 ## What it measures
 
-| Part | Weight | What it checks |
+One points table on the same scale as the open [AFDocs](https://afdocs.dev) standard: every check is worth 10, 7, 4 or 2 points by importance, a site earns a share of them, and the score is points earned over points possible. A check that cannot run on a site (no API spec, a timeout) is left out, never counted as zero.
+
+| Part | Points | What it checks |
 | --- | --- | --- |
-| **Access** | 40% | Can an agent find and read the content? The 23 checks of the [AFDocs](https://afdocs.dev) standard: llms.txt, Markdown versions of pages, page size, content structure, URL stability and sign-in walls. It also reports, without scoring, whether the site has llms-full.txt, an MCP server, agent skills, AI crawler access in robots.txt and a sitemap. |
-| **Answerability** | 40% | Can an agent answer real questions from it? Questions are written from up to 10 sampled pages. An AI agent then answers them, fetching pages without running JavaScript, and each answer is judged against the page it came from. Needs `--ai` and your own API key. |
-| **Freshness** | 20% | Is the content current and intact? Working links count for 50 points, Markdown that matches the HTML for 30, and page dates, changelog recency and OpenAPI coverage for 20. |
+| **Access** | 138 | The 23 AFDocs checks with AFDocs' own points (llms.txt, Markdown versions of pages, page size, content structure, URL stability, sign-in walls), plus whether search crawlers and the AI assistants that honour robots.txt may read the docs, and whether the sitemap lists the pages found on their own. |
+| **Freshness** | up to 21 | Links and section anchors on the pages work, pages say when they were last changed, sitemap entries still exist, and, when the site publishes an OpenAPI spec, the endpoints the docs mention exist in it and deprecated ones are marked. |
+| **Answerability** | 28 | An AI agent answers 5 to 8 real questions written from the sampled pages, fetching pages without JavaScript. Each answer is checked for reaching the right page, agreeing with the sentence it came from, and being backed by the passages it cites. Needs `--ai` and your own API key. |
 
-Grades: A+ is 97 and above, A 90 and above, B 80, C 70, D 60, and F below 60.
-
-When Answerability is not tested, the grade is the weighted average of the other two parts: Access counts for two thirds and Freshness for one third. The report says which parts the grade is based on. Every report records its `methodology.version`; scores from different versions are not comparable.
+MCP server, llms-full.txt and agent skills are reported but not scored. Grades: A+ is 97 and above, A 90 and above, B 80, C 70, D 60, and F below 60. AFDocs' caps apply: no llms.txt holds a site at 59. Without Answerability the score is out of the other points and the report says so. Every report records its `methodology.version`; scores from different versions are not comparable.
 
 ## Command line
 
@@ -33,7 +33,7 @@ agent-score check <url> [options]
   --help                        Print this help
 ```
 
-Give it the address of the docs, such as `https://docs.example.com` or `https://example.com/docs`. A bare domain such as `example.com` is resolved to its docs, such as `docs.example.com` or `example.com/docs`, when it has them.
+It scores exactly the address you give and the pages under it, such as `https://docs.example.com`, `https://example.com/docs` or `https://example.com/help`. A bare domain such as `example.com` is scored as itself; give the docs address to score the docs. When a bare domain has docs at `docs.example.com` or `example.com/docs`, the JSON report names them in `target.docsElsewhere`. If the address redirects, the scan follows the redirect, as an agent would.
 
 ### Answerability with your own model
 
@@ -75,7 +75,7 @@ const { report: full, answerabilityCostUsd } = await scanSite('https://docs.exam
 - It identifies itself as `Mozilla/5.0 (compatible; DocumentationAI-AgentScore/1.0; +https://documentation.ai/agent-score)`.
 - It follows robots.txt (RFC 9309), including `Crawl-delay`.
 - It waits 200 ms between requests to a site, makes at most 3 at a time, and honours `Retry-After`.
-- A scan stops after 260 requests or 45 seconds, and tests a sample of 10 pages.
+- A scan stops after 600 requests or 150 seconds, and tests a sample of 15 pages.
 - It refuses private and internal addresses, so it cannot be pointed at a local network. That also means it cannot scan `localhost`.
 
 To opt out, add this to robots.txt:

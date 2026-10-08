@@ -6,22 +6,50 @@ import type { Grade } from './report.types';
  * rules must never be compared as if they were the same measurement.
  */
 
-export const METHODOLOGY_VERSION = '2026-09.2';
-/** This package's version; packageVersions.vitest.ts keeps it equal to package.json. */
-export const ENGINE_VERSION = '0.1.0';
+export const METHODOLOGY_VERSION = '2026-09.6';
+/** The engine's own version, recorded in every report; the npm version once the engine is published. */
+export const ENGINE_VERSION = '0.2.0';
 /** Pinned exactly in package.json; packageVersions.vitest.ts keeps the two in step. */
 export const AFDOCS_VERSION = '0.20.0';
 
-export const PILLAR_WEIGHTS = {
-  access: 0.4,
-  answerability: 0.4,
-  freshness: 0.2,
+/**
+ * Points for our own checks, on AFDocs' scale: critical 10, high 7, medium 4,
+ * low 2. Each is a maximum; a check earns a share of it in proportion to
+ * what passed. AFDocs' 23 checks keep AFDocs' own points (130 in total).
+ *
+ * These are a weighting policy, not a measured finding: they are checked
+ * against real sites before any change, and a change bumps the methodology.
+ */
+export const CHECK_POINTS = {
+  /** Search crawlers and the AI fetchers that honour robots.txt may read the docs. */
+  'crawler-permissions': 5,
+  /** The sitemap lists the docs pages we found on our own. */
+  'sitemap-coverage': 3,
+  /** Sampled pages state when they were last changed. */
+  'update-info': 2,
+  /** Links, and links to sections, on the sampled pages resolve. */
+  'links-and-anchors': 6,
+  /** A sample of the sitemap's docs entries still exists. */
+  'sitemap-live': 3,
+  /** Endpoints the docs mention exist in the published OpenAPI spec. */
+  'api-spec-match': 5,
+  /** Where the docs use an operation the spec marks deprecated, they say so. */
+  'deprecation-notices': 5,
+  /** The answering agent reached the page that holds each answer. */
+  'evidence-retrieved': 7,
+  /** Its answers agree with the sentence they came from. */
+  'answers-correct': 14,
+  /** Its answers' claims are backed by the passages it cited. */
+  'answers-supported': 7,
 } as const;
 
-export const FRESHNESS_WEIGHTS = {
-  'link-health': 50,
-  'markdown-parity': 30,
-  recency: 20,
+export type OurCheckId = keyof typeof CHECK_POINTS;
+
+/** When a score is provisional: shown, but kept off the leaderboard and out of search. */
+export const PROVISIONAL_RULES = {
+  minPages: 5,
+  /** Share of the checks that applied but ended unverified. */
+  maxUnverifiedShare: 0.25,
 } as const;
 
 /** Composite grade scale from the product brief; AFDocs keeps its own. */
@@ -38,16 +66,18 @@ export const ROBOTS_TOKEN = 'DocumentationAI-AgentScore';
 export const USER_AGENT = `Mozilla/5.0 (compatible; ${ROBOTS_TOKEN}/1.0; +https://documentation.ai/agent-score)`;
 
 export const SCAN_LIMITS = {
-  samplePages: 10,
-  technicalDeadlineMs: 45_000,
-  requestTimeoutMs: 10_000,
-  maxBodyBytes: 2 * 1024 * 1024,
+  /** Pages AFDocs and our page checks read; 15 matches what Mintlify's checker samples. */
+  samplePages: 15,
+  technicalDeadlineMs: 150_000,
+  requestTimeoutMs: 15_000,
+  /** Real docs pages reach 5 MB (license lists); a cut-off page reads as broken Markdown. */
+  maxBodyBytes: 10 * 1024 * 1024,
   maxRedirects: 5,
   minIntervalMs: 200,
   maxConcurrentPerOrigin: 3,
-  technicalRequestBudget: 260,
+  technicalRequestBudget: 600,
   maxRetryAfterMs: 10_000,
-  resolveDeadlineMs: 8_000,
+  resolveDeadlineMs: 15_000,
   resolveRequestBudget: 30,
 } as const;
 

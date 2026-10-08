@@ -70,6 +70,8 @@ export interface FetchRecord {
 export interface SolveOutcome {
   answer: string;
   fetches: FetchRecord[];
+  /** The pages the answer names as its sources. */
+  citedUrls: string[];
   /** Set when the attempt failed for operational reasons and must not count. */
   operationalError?: string;
 }

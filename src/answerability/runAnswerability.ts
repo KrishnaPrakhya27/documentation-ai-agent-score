@@ -5,11 +5,11 @@ import {
   MODEL_PRICES,
 } from '../methodology';
 import type { AnswerabilityResult, TranscriptEntry } from '../report.types';
-import { diagnose, type FailureCause } from './diagnose';
+import { diagnose, samePage, type FailureCause } from './diagnose';
 import { generateQuestions } from './generateQuestions';
-import { judgeAnswer } from './judgeAnswer';
+import { judgeAnswer, type Judgement } from './judgeAnswer';
 import { solveQuestion } from './solveQuestion';
-import { loadSourcePages } from './sourcePages';
+import { containsQuote, loadSourcePages } from './sourcePages';
 import type {
   AnswerabilityDeps,
   AnswerabilityInput,
@@ -21,10 +21,30 @@ import type {
 
 /**
  * The slow half of a scan: writes questions from the sampled pages, lets an
- * agent answer each through the guarded transport, grades the answers and
- * explains every miss. Operational failures are excluded rather than scored;
- * fewer than five gradable questions leaves the pillar unavailable.
+ * agent answer each through the guarded transport, grades the answers,
+ * checks their sources and explains every miss. Operational failures are
+ * excluded rather than scored; fewer than five gradable questions leaves the
+ * part unavailable.
  */
+
+/** An Answerability result with nothing measured yet, or nothing measurable. */
+export function emptyAnswerability(
+  state: 'pending' | 'unavailable',
+  reason?: string,
+  models?: AnswerabilityResult['models'],
+): AnswerabilityResult {
+  return {
+    state,
+    ...(reason && { reason }),
+    ...(models && { models }),
+    total: 0,
+    correct: 0,
+    retrieved: 0,
+    answered: 0,
+    supported: 0,
+    transcript: [],
+  };
+}
 
 export async function runAnswerability(
   input: AnswerabilityInput,
@@ -43,15 +63,7 @@ export async function runAnswerability(
     solver: deps.models.solver.id,
     judge: deps.models.judge.id,
   };
-  const unavailable = (reason: string): AnswerabilityResult => ({
-    state: 'unavailable',
-    score: null,
-    passed: 0,
-    total: 0,
-    transcript: [],
-    reason,
-    models,
-  });
+  const unavailable = (reason: string) => emptyAnswerability('unavailable', reason, models);
 
   try {
     const pages = await loadSourcePages(fetcher, input.sampledUrls, deps.renderer);
@@ -72,7 +84,7 @@ export async function runAnswerability(
       ANSWERABILITY_LIMITS.solveConcurrency,
       async (question): Promise<SolveOutcome> => {
         if (inputTokens(usage) > ANSWERABILITY_LIMITS.maxInputTokensPerRun) {
-          return { answer: '', fetches: [], operationalError: 'token budget reached' };
+          return { answer: '', fetches: [], citedUrls: [], operationalError: 'token budget reached' };
         }
         const perQuestion = AbortSignal.any([
           controller.signal,
@@ -94,18 +106,12 @@ export async function runAnswerability(
       questions.map(async (question, index) => {
         const outcome = outcomes[index];
         if (outcome.operationalError) return;
-        const judgement = await judgeAnswer(
-          question,
-          outcome.answer,
-          deps.models,
-          usage,
-          controller.signal,
-        );
+        const judgement = await judgeAnswer(question, outcome, deps.models, usage, controller.signal);
         if (!judgement) return;
         const source = pages.find((page) => page.url === question.sourceUrl);
         const diagnosis = diagnose(question, source, outcome, judgement.verdict, judgement.reason);
         if (diagnosis.cause) causes.push(diagnosis.cause);
-        transcript[index] = entryFor(question, outcome, judgement.verdict, diagnosis.reason);
+        transcript[index] = entryFor(question, outcome, judgement, diagnosis.reason);
       }),
     );
 
@@ -116,15 +122,16 @@ export async function runAnswerability(
         usage,
       );
     }
-    const passed = graded.filter((entry) => entry.verdict === 'correct').length;
     return finish(
       {
         state: 'complete',
-        score: Math.round((passed / graded.length) * 100),
-        passed,
-        total: graded.length,
-        transcript: graded,
         models,
+        total: graded.length,
+        correct: graded.filter((entry) => entry.verdict === 'correct').length,
+        retrieved: graded.filter((entry) => entry.retrieved).length,
+        answered: graded.filter((entry) => entry.verdict !== 'not-found').length,
+        supported: graded.filter((entry) => entry.supported === true).length,
+        transcript: graded,
       },
       usage,
     );
@@ -147,17 +154,29 @@ export async function runAnswerability(
 function entryFor(
   question: GeneratedQuestion,
   outcome: SolveOutcome,
-  verdict: TranscriptEntry['verdict'],
+  judgement: Judgement,
   reason: string,
 ): TranscriptEntry {
   return {
     question: question.question,
     sourceUrl: question.sourceUrl,
     answer: outcome.answer.slice(0, 1_200),
-    verdict,
+    verdict: judgement.verdict,
     reason,
+    retrieved: reachedEvidence(question, outcome),
+    supported: judgement.supported,
     pagesVisited: outcome.fetches.map((fetch) => fetch.url).slice(0, 6),
+    citedUrls: outcome.citedUrls.slice(0, 6),
   };
+}
+
+/** Whether the agent read the page with the answer, or another page that carries the same evidence. */
+function reachedEvidence(question: GeneratedQuestion, outcome: SolveOutcome): boolean {
+  return outcome.fetches.some(
+    (fetch) =>
+      (samePage(fetch.url, question.sourceUrl) && fetch.status !== null && fetch.status < 400) ||
+      (fetch.agentText.length > 0 && containsQuote(fetch.agentText, question.evidenceQuote)),
+  );
 }
 
 function finish(result: AnswerabilityResult, usage: ModelUsage[]): AnswerabilityRun {

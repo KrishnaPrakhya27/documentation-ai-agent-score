@@ -43,6 +43,8 @@ export interface ScanResponse {
 
 export interface ScanHttpClient {
   fetch(url: string, init?: ScanRequestInit): Promise<ScanResponse>;
+  /** True once the scan's own deadline or request budget stops further requests. */
+  limitReached?(): boolean;
 }
 
 export interface GuardedFetcherOptions {
@@ -68,6 +70,8 @@ export interface FetchStats {
   requests: number;
   robotsBlocked: string[];
   retryAfterWaits: number;
+  /** Requests the site still refused as too many (HTTP 429) after waiting and retrying. */
+  rateLimited: number;
 }
 
 interface RawResult {
@@ -85,10 +89,21 @@ interface CachedResult extends RawResult {
 }
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
-const MAX_RETRIES = 2;
+/** Too many requests, or unavailable: wait, retry, and ease off that site. */
+const REFUSAL_STATUSES = new Set([429, 503]);
+const MAX_RETRIES = 3;
+/** First wait after a refusal that names no usable time; it doubles on each retry. */
+const REFUSAL_BACKOFF_MS = 1_000;
+/** Spacing for a site after it refuses a request; it doubles on each refusal, up to the maximum. */
+const REFUSED_ORIGIN_INTERVAL_MS = 1_000;
+const MAX_REFUSED_ORIGIN_INTERVAL_MS = 4_000;
 const MAX_CACHE_CHARS = 40 * 1024 * 1024;
-const DEFAULT_ACCEPT =
-  'text/html,application/xhtml+xml,text/markdown;q=0.9,text/plain;q=0.8,*/*;q=0.5';
+/**
+ * What AFDocs' own fetch sends, so a site answers our checks exactly as it
+ * answers AFDocs. Listing text/markdown here made sites that negotiate content
+ * return Markdown where a check expected the HTML page.
+ */
+const DEFAULT_ACCEPT = '*/*';
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -101,10 +116,12 @@ export class GuardedFetcher implements ScanHttpClient {
   private readonly cache = new Map<string, CachedResult>();
   private cachedChars = 0;
   private readonly slowedOrigins = new Set<string>();
+  private readonly refusedOriginIntervals = new Map<string, number>();
   private readonly counters: FetchStats = {
     requests: 0,
     robotsBlocked: [],
     retryAfterWaits: 0,
+    rateLimited: 0,
   };
 
   constructor(private readonly options: GuardedFetcherOptions) {
@@ -124,6 +141,11 @@ export class GuardedFetcher implements ScanHttpClient {
     this.robots = new RobotsPolicy(options.robotsToken, (url) =>
       this.fetchWithoutRobots(url),
     );
+  }
+
+  limitReached(): boolean {
+    const pastDeadline = !!this.options.deadline && Date.now() >= this.options.deadline;
+    return pastDeadline || this.counters.requests >= this.options.maxRequests;
   }
 
   stats(): FetchStats {
@@ -187,7 +209,8 @@ export class GuardedFetcher implements ScanHttpClient {
       }
 
       const result: CachedResult = { ...raw, url: url.href, redirected };
-      if (cacheKey) this.remember(cacheKey, result);
+      // A refusal is about this moment, not the page; a later request may succeed.
+      if (cacheKey && !REFUSAL_STATUSES.has(result.status)) this.remember(cacheKey, result);
       return toResponse(result);
     }
   }
@@ -202,7 +225,7 @@ export class GuardedFetcher implements ScanHttpClient {
     }
     if (!decision.allowed) {
       this.counters.robotsBlocked.push(url.href);
-      throw new RobotsDisallowedError(url.href);
+      throw new RobotsDisallowedError(url.href, decision.state === 'unreachable' ? 'unreachable' : 'ok');
     }
   }
 
@@ -227,23 +250,28 @@ export class GuardedFetcher implements ScanHttpClient {
           signal,
           dispatcher: this.agent,
         });
-        const { text, truncated } =
-          method === 'HEAD'
-            ? { text: '', truncated: false }
-            : await readCappedText(response, maxBytes);
+        // A redirect's body is never read, and some servers trickle it for many seconds.
+        const skipBody = method === 'HEAD' || REDIRECT_STATUSES.has(response.status);
+        if (skipBody) await response.body?.cancel();
+        const { text, truncated } = skipBody
+          ? { text: '', truncated: false }
+          : await readCappedText(response, maxBytes);
 
-        const waitMs = retryAfterMs(response.headers.get('retry-after'));
+        const refused = REFUSAL_STATUSES.has(response.status);
+        if (refused) this.easeOffAfterRefusal(url.origin);
+        const waitMs = retryWaitMs(response.headers.get('retry-after'), attempt);
         const shouldWait =
-          (response.status === 429 || response.status === 503) &&
-          waitMs !== null &&
+          refused &&
+          attempt < MAX_RETRIES &&
           waitMs <= this.options.maxRetryAfterMs &&
-          attempt < MAX_RETRIES;
+          this.hasTimeToWait(waitMs);
         if (shouldWait) {
           this.counters.retryAfterWaits++;
           this.scheduler.pause(url.origin, waitMs);
           await sleep(waitMs);
           continue;
         }
+        if (response.status === 429) this.counters.rateLimited++;
 
         return {
           status: response.status,
@@ -265,6 +293,20 @@ export class GuardedFetcher implements ScanHttpClient {
       throw new RequestBudgetError(this.options.maxRequests);
     }
     this.counters.requests++;
+  }
+
+  /** Spaces later requests to a site that refused one, more widely each time it refuses. */
+  private easeOffAfterRefusal(origin: string): void {
+    const previous = this.refusedOriginIntervals.get(origin);
+    const next = previous
+      ? Math.min(MAX_REFUSED_ORIGIN_INTERVAL_MS, previous * 2)
+      : REFUSED_ORIGIN_INTERVAL_MS;
+    this.refusedOriginIntervals.set(origin, next);
+    this.scheduler.slowDown(origin, next);
+  }
+
+  private hasTimeToWait(waitMs: number): boolean {
+    return !this.options.deadline || Date.now() + waitMs < this.options.deadline;
   }
 
   private timeoutMs(): number {
@@ -305,6 +347,16 @@ function toResponse(result: CachedResult): ScanResponse {
     truncated: result.truncated,
     text: async () => result.body,
   };
+}
+
+/**
+ * How long to wait before retrying a refused request: the site's Retry-After
+ * when it names a time, otherwise 1s, 2s, 4s. `Retry-After: 0` from a site that
+ * is refusing us is not taken literally.
+ */
+export function retryWaitMs(retryAfter: string | null, attempt: number, now = Date.now()): number {
+  const asked = retryAfterMs(retryAfter, now);
+  return asked !== null && asked > 0 ? asked : REFUSAL_BACKOFF_MS * 2 ** attempt;
 }
 
 /** Seconds or an HTTP date, as RFC 9110 allows; null when absent or unusable. */

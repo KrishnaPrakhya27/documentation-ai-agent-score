@@ -2,7 +2,8 @@ import { parse, type HTMLElement } from 'node-html-parser';
 
 /**
  * Reads what the checks need out of a fetched HTML page: the article text,
- * the links inside it and any last-updated date the page declares.
+ * the links and section references inside it, the ids a link can point at,
+ * and any last-updated date the page declares.
  */
 
 const CONTENT_SELECTORS = [
@@ -30,9 +31,17 @@ export interface ParsedPage {
   text: string;
   /** JSON-LD blocks, read before scripts are stripped from the tree. */
   jsonLd: string[];
+  /** Every id and anchor name on the page: what a `#fragment` link can land on. */
+  anchors: Set<string>;
+  /** The response's Last-Modified header, when the server sent one. */
+  lastModified: Date | null;
 }
 
-export function parsePage(url: string, html: string): ParsedPage {
+export interface PageHeaders {
+  lastModified?: string | null;
+}
+
+export function parsePage(url: string, html: string, headers: PageHeaders = {}): ParsedPage {
   const root = parse(html);
   const jsonLd = root
     .querySelectorAll('script[type="application/ld+json"]')
@@ -44,26 +53,93 @@ export function parsePage(url: string, html: string): ParsedPage {
     CONTENT_SELECTORS.map((selector) => root.querySelector(selector)).find(Boolean) ??
     root.querySelector('body') ??
     root;
-  return { url, root, content, text: collapse(content.textContent), jsonLd };
+  return {
+    url,
+    root,
+    content,
+    text: collapse(content.textContent),
+    jsonLd,
+    anchors: anchorIds(root),
+    lastModified: toDate(headers.lastModified),
+  };
 }
 
-/** Absolute http(s) links in the article, without fragments, de-duplicated. */
-export function contentLinks(page: ParsedPage): string[] {
-  const links = new Set<string>();
+/** Every `id` and `<a name>` on the page, as a fragment link would spell it. */
+export function anchorIds(root: HTMLElement): Set<string> {
+  const ids = new Set<string>();
+  for (const node of root.querySelectorAll('[id]')) {
+    const id = node.getAttribute('id')?.trim();
+    if (id) ids.add(id);
+  }
+  for (const node of root.querySelectorAll('a[name]')) {
+    const name = node.getAttribute('name')?.trim();
+    if (name) ids.add(name);
+  }
+  return ids;
+}
+
+/** A link in the article, split into the page it points at and the section on it, if any. */
+export interface ContentReference {
+  /** Absolute http(s) URL without the fragment. */
+  url: string;
+  fragment: string | null;
+}
+
+/** Every link in the article an agent could follow, including links to a section of the same page. */
+export function contentReferences(page: ParsedPage): ContentReference[] {
+  const seen = new Set<string>();
+  const references: ContentReference[] = [];
   for (const anchor of page.content.querySelectorAll('a[href]')) {
     const href = anchor.getAttribute('href')?.trim();
-    if (!href || href.startsWith('#')) continue;
+    if (!href) continue;
     if (/^(mailto|tel|javascript|data):/i.test(href)) continue;
     try {
       const url = new URL(href, page.url);
       if (url.protocol !== 'http:' && url.protocol !== 'https:') continue;
+      const fragment = decodeFragment(url.hash);
       url.hash = '';
-      links.add(url.href);
+      const key = `${url.href}#${fragment ?? ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      references.push({ url: url.href, fragment });
     } catch {
       // Unparseable hrefs are not links an agent can follow either.
     }
   }
-  return [...links];
+  return references;
+}
+
+/** Absolute http(s) links in the article, without fragments, de-duplicated. */
+export function contentLinks(page: ParsedPage): string[] {
+  return [...new Set(contentReferences(page).map((reference) => reference.url))];
+}
+
+function decodeFragment(hash: string): string | null {
+  const raw = hash.replace(/^#/, '');
+  if (!raw) return null;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * One document, however it was linked: no scheme, no www, no `.md` twin, no
+ * trailing slash, no query or fragment. What sitemap coverage and page
+ * identity compare on.
+ */
+export function pageKey(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname
+      .replace(/\/index\.mdx?$/, '')
+      .replace(/\.mdx?$/, '')
+      .replace(/\/+$/, '');
+    return `${parsed.hostname.replace(/^www\./, '').toLowerCase()}${path}`;
+  } catch {
+    return url;
+  }
 }
 
 /** The page's declared last-updated date, most reliable source first. */
@@ -97,7 +173,7 @@ export function declaredUpdateDate(page: ParsedPage): Date | null {
     const date = toDate(time.getAttribute('datetime'));
     if (date) return date;
   }
-  return null;
+  return page.lastModified;
 }
 
 export function firstDateIn(text: string): Date | null {

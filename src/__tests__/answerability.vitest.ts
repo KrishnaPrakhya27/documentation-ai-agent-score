@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { diagnose, samePage } from '../answerability/diagnose';
 import { selectValidQuestions } from '../answerability/generateQuestions';
-import { estimateCostUsd, runAnswerability } from '../answerability/runAnswerability';
+import { emptyAnswerability, estimateCostUsd, runAnswerability } from '../answerability/runAnswerability';
 import { containsQuote } from '../answerability/sourcePages';
 import type {
   AnswerabilityModels,
@@ -121,7 +121,7 @@ function models(): AnswerabilityModels {
           {
             type: 'text',
             text: toolOutput.includes('open Settings')
-              ? 'Open Settings, choose API keys, then press Create key.'
+              ? `Open Settings, choose API keys, then press Create key.\nSources: ${site.origin}/docs/${slug}`
               : 'I am not sure.',
           },
         ],
@@ -135,10 +135,11 @@ function models(): AnswerabilityModels {
   const judge = textModel((prompt) => {
     const text = lastUserText(prompt);
     const answer = text.split('"""')[1] ?? '';
+    const cited = text.includes('The passages the agent cited') && text.includes('--- http');
     return JSON.stringify(
       answer.includes('Open Settings')
-        ? { verdict: 'correct', reason: 'It names the right steps.' }
-        : { verdict: 'incorrect', reason: 'It does not give the steps.' },
+        ? { verdict: 'correct', reason: 'It names the right steps.', supported: cited }
+        : { verdict: 'incorrect', reason: 'It does not give the steps.', supported: false },
     );
   });
 
@@ -174,17 +175,17 @@ describe('runAnswerability', () => {
 
     const result = run.result;
     expect(result.state).toBe('complete');
-    expect(result.total).toBe(6);
-    expect(result.passed).toBe(5);
-    expect(result.score).toBe(83);
+    expect(result).toMatchObject({ total: 6, correct: 5, retrieved: 5, answered: 5, supported: 5 });
 
     const miss = result.transcript.find((entry) => entry.verdict !== 'correct');
     expect(miss?.verdict).toBe('not-found');
     expect(miss?.reason).toMatch(/never reached \/docs\/echo/);
+    expect(miss).toMatchObject({ retrieved: false, supported: null });
 
     const hit = result.transcript.find((entry) => entry.question.includes('alpha'));
     expect(hit?.reason).toBe('Answered correctly from /docs/alpha.');
     expect(hit?.pagesVisited).toEqual([`${site.origin}/docs/alpha`]);
+    expect(hit).toMatchObject({ retrieved: true, supported: true, citedUrls: [`${site.origin}/docs/alpha`] });
     expect(run.costUsd).toBeGreaterThan(0);
   });
 
@@ -197,7 +198,7 @@ describe('runAnswerability', () => {
       },
     );
     expect(run.result.state).toBe('unavailable');
-    expect(run.result.score).toBeNull();
+    expect(run.result.total).toBe(0);
   });
 });
 
@@ -237,7 +238,7 @@ describe('diagnose', () => {
     answerFacts: ['Open Settings'],
     evidenceQuote: QUOTE,
   };
-  const outcome = (fetches: SolveOutcome['fetches']): SolveOutcome => ({ answer: 'x', fetches });
+  const outcome = (fetches: SolveOutcome['fetches']): SolveOutcome => ({ answer: 'x', fetches, citedUrls: [] });
   const read = (agentText: string, extra: Partial<SolveOutcome['fetches'][number]> = {}) => ({
     url: 'https://d.test/docs/keys.md',
     status: 200,
@@ -278,40 +279,57 @@ describe('containsQuote', () => {
 });
 
 describe('finalizeReport', () => {
-  it('computes the composite and leads with the answerability fix', () => {
+  it('adds the Answerability checks to the table and leads with the cause behind the misses', () => {
+    const afdocsCheck = {
+      id: 'x',
+      group: 'access',
+      category: 'content-discoverability',
+      title: 'X',
+      status: 'fail',
+      source: 'afdocs',
+      points: { max: 10, earned: 0 },
+      message: '',
+      fix: 'Do x.',
+    };
     const technical = {
       stage: 'technical',
       target: { scopeRoot: 'https://d.test/docs', key: 'd.test/docs' },
-      checks: [],
+      checks: [afdocsCheck, { ...afdocsCheck, id: 'y', status: 'pass', points: { max: 10, earned: 10 } }],
+      additionalChecks: [],
+      afdocs: null,
       site: { name: 'D', title: null },
-      topFixes: [{ checkId: 'x', title: 'X', fix: 'Do x.' }],
+      topFixes: [{ checkId: 'x', title: 'X', fix: 'Do x.', points: 10 }],
       limitations: [],
+      coverage: { pagesTested: 6, sampledUrls: ['https://d.test/docs/a'], rateLimitedRequests: 0 },
       timings: { startedAt: '2026-09-23T00:00:00Z' },
-      pillars: {
-        access: { state: 'complete', score: 80, profile: 'developer-docs', afdocs: null },
-        freshness: { state: 'complete', score: 70, components: [] },
-        answerability: { state: 'pending', score: null, passed: 0, total: 0, transcript: [] },
-      },
+      answerability: emptyAnswerability('pending'),
     } as unknown as AgentScoreReport;
     const answerability: AnswerabilityResult = {
       state: 'complete',
-      score: 50,
-      passed: 3,
       total: 6,
+      correct: 3,
+      retrieved: 3,
+      answered: 3,
+      supported: 3,
       transcript: Array.from({ length: 3 }, (_, index) => ({
         question: `q${index}`,
         sourceUrl: 'https://d.test/docs/a',
         answer: '',
         verdict: 'not-found' as const,
         reason: 'The agent never reached /docs/a, the page with the answer.',
+        retrieved: false,
+        supported: null,
         pagesVisited: [],
+        citedUrls: [],
       })),
     };
 
-    const report = finalizeReport(technical, answerability, 'https://documentation.ai/agent-score/d.test/docs');
+    const report = finalizeReport(technical, answerability, 'https://documentation.ai/agent-score/d');
     expect(report.stage).toBe('final');
-    expect(report.overall).toEqual({ score: 66, grade: 'D' });
-    expect(report.topFixes[0].checkId).toBe('answerability');
+    // 10 (AFDocs) + 3.5 retrieved + 7 correct + 7 supported of 10 + 10 + 7 + 14 + 7.
+    expect(report.overall).toMatchObject({ earned: 27.5, possible: 48, score: 57, grade: 'F' });
+    expect(report.groups.answerability).toMatchObject({ state: 'complete', earned: 17.5, possible: 28 });
+    expect(report.topFixes[0]).toMatchObject({ checkId: 'answerability', points: 10.5 });
     expect(report.fixPrompt).toContain('Questions an agent could not answer');
   });
 });

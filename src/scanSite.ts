@@ -29,7 +29,7 @@ export interface ScanSiteResult {
   answerabilityCostUsd: number;
 }
 
-export function publicReportUrl(siteKey: string): string {
+export function reportUrlForKey(siteKey: string): string {
   return `https://documentation.ai/agent-score/${siteKey}`;
 }
 
@@ -38,7 +38,7 @@ export async function scanSite(url: string, options: ScanSiteOptions = {}): Prom
   const resolved = await resolveSubmittedUrl(url, profile);
   onProgress?.(`Scanning ${resolved.target.key} (${resolved.target.profile})`);
 
-  const reportUrl = options.reportUrl ?? publicReportUrl(resolved.target.key);
+  const reportUrl = options.reportUrl ?? reportUrlForKey(resolved.target.key);
   const technical = await runTechnicalAssessment({
     target: resolved.target,
     profileChosen: !!profile,
