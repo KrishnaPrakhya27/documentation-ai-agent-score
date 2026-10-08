@@ -10,10 +10,10 @@ import type { AgentScoreReport, ContentProfile } from './report.types';
 import { scanSite } from './scanSite';
 
 /**
- * `npx tsx src/services/agent-score/cli.ts check <url>` (or, once published,
- * `npx @documentation-ai/agent-score check <url>`): scans a docs site from this
- * machine and prints the report. Answerability runs only with --ai and that
- * provider's key in its usual environment variable. Nothing is uploaded.
+ * `npx @documentation.ai/agent-score check <url>`, or `npx tsx <this file>
+ * check <url>` from source: scans a docs site from this machine and prints the
+ * report. Answerability runs only with --ai and that provider's key in its
+ * usual environment variable. Nothing is uploaded.
  */
 
 const USAGE = `Usage: agent-score check <url> [options]

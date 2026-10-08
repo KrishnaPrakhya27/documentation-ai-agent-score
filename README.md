@@ -3,7 +3,7 @@
 Scores how well AI agents can find, read and answer questions from a documentation site, help center or knowledge base, from 0 to 100 with a letter grade. It is the engine behind [documentation.ai/agent-score](https://documentation.ai/agent-score), and gives the same results when you run it yourself.
 
 ```bash
-npx @documentation-ai/agent-score check https://docs.example.com
+npx @documentation.ai/agent-score check https://docs.example.com
 ```
 
 Needs Node.js 22 or later. The scan runs from your machine and nothing is uploaded.
@@ -47,7 +47,7 @@ It scores exactly the address you give and the pages under it, such as `https://
 | `gateway` | `AI_GATEWAY_API_KEY` | anthropic/claude-haiku-4.5, anthropic/claude-haiku-4.5, anthropic/claude-sonnet-5 |
 
 ```bash
-ANTHROPIC_API_KEY=sk-... npx @documentation-ai/agent-score check https://docs.example.com --ai anthropic
+ANTHROPIC_API_KEY=sk-... npx @documentation.ai/agent-score check https://docs.example.com --ai anthropic
 ```
 
 The run prints its estimated cost. A test is 5 to 8 questions; on a 10-page sample of our own docs it cost about $0.24 with the Anthropic defaults.
@@ -55,7 +55,7 @@ The run prints its estimated cost. A test is 5 to 8 questions; on a 10-page samp
 ## Use it from code
 
 ```ts
-import { createAnswerabilityModels, scanSite } from '@documentation-ai/agent-score';
+import { createAnswerabilityModels, scanSite } from '@documentation.ai/agent-score';
 
 const { report } = await scanSite('https://docs.example.com');
 console.log(report.overall.score, report.overall.grade, report.topFixes);
@@ -85,15 +85,9 @@ User-agent: DocumentationAI-AgentScore
 Disallow: /
 ```
 
-## Development
+## Contributing
 
-```bash
-npm install
-npm test
-npm run typecheck
-npm run build
-npm run check -- https://docs.example.com   # run the CLI from source
-```
+Issues and pull requests are welcome. [DEVELOPMENT.md](DEVELOPMENT.md) covers running it from source, where the code comes from and how releases are made.
 
 ## Credits
 

@@ -1,5 +1,5 @@
 {
-  "name": "@documentation-ai/agent-score",
+  "name": "@documentation.ai/agent-score",
   "version": "0.2.0",
   "description": "Agent Readiness Score: how well AI agents can find, read and answer questions from a documentation site, help center or knowledge base.",
   "license": "MIT",
@@ -7,10 +7,10 @@
   "homepage": "https://documentation.ai/agent-score",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KrishnaPrakhya27/documentation-ai-agent-score.git"
+    "url": "git+https://github.com/documentation-ai/documentation-ai-agent-score.git"
   },
   "bugs": {
-    "url": "https://github.com/KrishnaPrakhya27/documentation-ai-agent-score/issues"
+    "url": "https://github.com/documentation-ai/documentation-ai-agent-score/issues"
   },
   "keywords": [
     "ai-agents",
@@ -24,7 +24,7 @@
   ],
   "type": "module",
   "bin": {
-    "agent-score": "./dist/cli.js"
+    "agent-score": "dist/cli.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -49,6 +49,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "check": "tsx src/cli.ts check",
+    "release": "node scripts/release.mjs",
     "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {

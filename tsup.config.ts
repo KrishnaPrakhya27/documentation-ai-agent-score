@@ -6,7 +6,7 @@ export default defineConfig({
   platform: 'node',
   target: 'node22',
   dts: { entry: { index: 'src/index.ts' } },
-  sourcemap: true,
+  sourcemap: false,
   clean: true,
   // The AI provider SDKs are optional dependencies, loaded only when Answerability runs.
   external: [/^@ai-sdk\//],

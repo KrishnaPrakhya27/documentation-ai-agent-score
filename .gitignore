@@ -4,3 +4,5 @@ coverage/
 *.tgz
 .env
 .env.*
+# What the release script hands to npm, rebuilt on every release.
+.npm-package/
