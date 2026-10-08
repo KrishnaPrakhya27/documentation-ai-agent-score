@@ -2,6 +2,7 @@ import { afdocsChecks, summarizeAfdocs } from './afdocs/afdocsChecks';
 import {
   llmsTxtFrom,
   runAfdocs,
+  type AfdocsHooks,
   type AfdocsRun,
   type AfdocsSample,
 } from './afdocs/runAfdocs';
@@ -55,6 +56,8 @@ export interface TechnicalAssessmentInput {
 export interface EngineOptions {
   now?: () => number;
   fetcher?: Partial<GuardedFetcherOptions>;
+  /** Short messages as the scan moves on, for showing progress. */
+  onProgress?: (message: string) => void;
 }
 
 export interface TechnicalAssessment {
@@ -87,14 +90,24 @@ export async function runTechnicalAssessment(
     const sampleReady = new Promise<AfdocsSample>((resolve) => {
       announceSample = resolve;
     });
+    const progress = options.onProgress;
+    let pageChecksNote = '';
+    progress?.('Reading llms.txt, robots.txt and the sitemap');
     const runChecksAndAnnounce = async () => {
-      const run = await runAfdocsWithFallback(input.target, fetcher, scopeSitemap, announceSample);
+      const run = await runAfdocsWithFallback(input.target, fetcher, scopeSitemap, {
+        onSampled: announceSample,
+        onCheckDone: (done, total) => progress?.(`Running the agent checks: ${done} of ${total} done${pageChecksNote}`),
+      });
       // Fewer than five pages never announced a sample; start from what AFDocs ended with.
       announceSample(sampleOf(run));
+      progress?.('Agent checks done; finishing the page checks');
       return run;
     };
-    const runPageChecksWhenSampled = async () =>
-      runPageChecks(await sampleReady, { ...base, fetcher, sitemap: scopeSitemap }, input, now);
+    const runPageChecksWhenSampled = async () => {
+      const sample = await sampleReady;
+      pageChecksNote = `, checking links and dates on ${sample.sampledUrls.length} sampled pages`;
+      return runPageChecks(sample, { ...base, fetcher, sitemap: scopeSitemap }, input, now);
+    };
     const afdocsDone = runChecksAndAnnounce();
     const pageStage = runPageChecksWhenSampled();
 
@@ -222,7 +235,7 @@ async function runAfdocsWithFallback(
   target: ReportTarget,
   fetcher: GuardedFetcher,
   scopeSitemap: Promise<ScopeSitemap>,
-  onSampled: (sample: AfdocsSample) => void,
+  hooks: Pick<AfdocsHooks, 'onSampled' | 'onCheckDone'>,
 ): Promise<AfdocsRun> {
   const options = {
     maxLinksToTest: SCAN_LIMITS.samplePages,
@@ -234,7 +247,7 @@ async function runAfdocsWithFallback(
     target.scopeRoot,
     fetcher,
     { ...options, samplingStrategy: 'deterministic' },
-    { onSampled, minPages: 5 },
+    { ...hooks, minPages: 5 },
   );
   if (first.sampledUrls.length >= 5) return first;
 
@@ -248,7 +261,7 @@ async function runAfdocsWithFallback(
     target.scopeRoot,
     fetcher,
     { ...options, samplingStrategy: 'curated', curatedPages },
-    { onSampled, minPages: 1 },
+    { ...hooks, minPages: 1 },
   );
   return { ...second, totalPages: sitemap.inScope.length };
 }

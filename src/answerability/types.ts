@@ -28,6 +28,8 @@ export interface AnswerabilityDeps {
   /** Test seams for the transport; hosted scans use the defaults. */
   fetcher?: Partial<import('../transport/guardedFetch').GuardedFetcherOptions>;
   now?: () => number;
+  /** Short messages as the test moves on, for showing progress. */
+  onProgress?: (message: string) => void;
 }
 
 export interface ModelUsage {

@@ -1,6 +1,6 @@
 {
   "name": "@documentation.ai/agent-score",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Agent Readiness Score: how well AI agents can find, read and answer questions from a documentation site, help center or knowledge base.",
   "license": "MIT",
   "author": "Documentation.AI (https://documentation.ai)",

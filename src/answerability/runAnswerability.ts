@@ -64,13 +64,16 @@ export async function runAnswerability(
     judge: deps.models.judge.id,
   };
   const unavailable = (reason: string) => emptyAnswerability('unavailable', reason, models);
+  const progress = deps.onProgress;
 
   try {
+    progress?.('Reading the sampled pages to write questions from');
     const pages = await loadSourcePages(fetcher, input.sampledUrls, deps.renderer);
     if (pages.length < 2) {
       return finish(unavailable('Too few readable pages to write questions from.'), usage);
     }
 
+    progress?.(`Writing questions from ${pages.length} pages`);
     const questions = await generateQuestions(pages, deps.models, usage, controller.signal);
     if (questions.length < ANSWERABILITY_LIMITS.minQuestions) {
       return finish(
@@ -79,6 +82,8 @@ export async function runAnswerability(
       );
     }
 
+    let answered = 0;
+    progress?.(`Answering the questions: 0 of ${questions.length} done`);
     const outcomes = await mapLimited(
       questions,
       ANSWERABILITY_LIMITS.solveConcurrency,
@@ -90,16 +95,20 @@ export async function runAnswerability(
           controller.signal,
           AbortSignal.timeout(ANSWERABILITY_LIMITS.solveTimeoutMs),
         ]);
-        return solveQuestion(question, {
+        const outcome = await solveQuestion(question, {
           http: fetcher,
           target: input.target,
           models: deps.models,
           usage,
           abortSignal: perQuestion,
         });
+        answered += 1;
+        progress?.(`Answering the questions: ${answered} of ${questions.length} done`);
+        return outcome;
       },
     );
 
+    progress?.('Checking each answer against its source page');
     const transcript: TranscriptEntry[] = [];
     const causes: FailureCause[] = [];
     await Promise.all(

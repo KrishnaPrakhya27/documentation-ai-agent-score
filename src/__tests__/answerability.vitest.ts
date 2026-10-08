@@ -189,6 +189,27 @@ describe('runAnswerability', () => {
     expect(run.costUsd).toBeGreaterThan(0);
   });
 
+  it('reports reading, writing, answering and checking as it goes', async () => {
+    const messages: string[] = [];
+    await runAnswerability(
+      { target: target(), sampledUrls: SLUGS.map((slug) => `${site.origin}/docs/${slug}`) },
+      {
+        models: models(),
+        fetcher: { validateUrl: allowOnly(site.origin), isAllowedAddress: () => true, minIntervalMs: 0 },
+        onProgress: (message) => messages.push(message),
+      },
+    );
+
+    expect(messages.slice(0, 2)).toEqual([
+      'Reading the sampled pages to write questions from',
+      expect.stringMatching(/^Writing questions from \d+ pages$/),
+    ]);
+    expect(messages.slice(2, -1)).toEqual(
+      Array.from({ length: 7 }, (_, done) => `Answering the questions: ${done} of 6 done`),
+    );
+    expect(messages.at(-1)).toBe('Checking each answer against its source page');
+  });
+
   it('is unavailable, not zero, when too few questions can be written', async () => {
     const run = await runAnswerability(
       { target: target(), sampledUrls: [`${site.origin}/docs/alpha`] },

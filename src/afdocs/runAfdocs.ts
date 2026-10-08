@@ -36,7 +36,8 @@ export interface AfdocsSample {
 }
 
 export interface AfdocsHooks {
-  onCheckDone?: (checkId: string, elapsedMs: number) => void;
+  /** After each check, skipped ones included: how many of all the checks are done. */
+  onCheckDone?: (done: number, total: number) => void;
   /** Fires once, as soon as at least `minPages` pages are sampled. */
   onSampled?: (sample: AfdocsSample) => void;
   minPages?: number;
@@ -100,7 +101,8 @@ export async function runAfdocs(
   };
 
   const results: CheckResult[] = [];
-  for (const check of getChecksSorted()) {
+  const checks = getChecksSorted();
+  for (const check of checks) {
     if (check.dependsOn.length > 0) {
       const groups = normalizeDependencies(check.dependsOn);
       const anyDependencyRan = groups.some((group) =>
@@ -116,12 +118,12 @@ export async function runAfdocs(
         };
         results.push(skipped);
         ctx.previousResults.set(check.id, skipped);
+        hooks.onCheckDone?.(results.length, checks.length);
         continue;
       }
     }
 
     let result: CheckResult;
-    const started = Date.now();
     cutOff = null;
     try {
       result = await check.run(ctx);
@@ -136,9 +138,9 @@ export async function runAfdocs(
     if (cutOff && (result.status === 'fail' || result.status === 'warn')) {
       result = withoutOurCutOff(result, cutOff);
     }
-    hooks.onCheckDone?.(check.id, Date.now() - started);
     results.push(result);
     ctx.previousResults.set(check.id, result);
+    hooks.onCheckDone?.(results.length, checks.length);
     announceSample();
   }
 

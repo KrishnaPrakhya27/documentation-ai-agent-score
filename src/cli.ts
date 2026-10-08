@@ -7,7 +7,7 @@ import {
 } from './answerability/providers';
 import { ENGINE_VERSION } from './methodology';
 import type { AgentScoreReport, ContentProfile } from './report.types';
-import { scanSite } from './scanSite';
+import { scanSite, type ScanSiteOptions, type ScanSiteResult } from './scanSite';
 
 /**
  * `npx @documentation.ai/agent-score check <url>`, or `npx tsx <this file>
@@ -54,10 +54,9 @@ async function runCli(args: string[]): Promise<void> {
   }
 
   const started = Date.now();
-  const { report, answerabilityCostUsd } = await scanSite(url, {
+  const { report, answerabilityCostUsd } = await scanWithProgress(url, {
     models: await modelsFromFlags(flags),
     profile: profileFromFlags(flags),
-    onProgress: (message) => process.stderr.write(`${message}\n`),
   });
   if (answerabilityCostUsd > 0) process.stderr.write(`Answerability cost about $${answerabilityCostUsd}\n`);
 
@@ -66,6 +65,63 @@ async function runCli(args: string[]): Promise<void> {
   } else {
     process.stdout.write(summarize(report, Date.now() - started));
   }
+}
+
+async function scanWithProgress(url: string, options: ScanSiteOptions): Promise<ScanSiteResult> {
+  const progress = progressLine(process.stderr);
+  try {
+    return await scanSite(url, { ...options, onProgress: progress.update });
+  } finally {
+    progress.stop();
+  }
+}
+
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+interface ProgressLine {
+  update: (message: string) => void;
+  stop: () => void;
+}
+
+/**
+ * On a terminal, one line that redraws with a spinner, the seconds so far and
+ * the scan's latest step. Elsewhere (CI, a pipe), one plain line per new step.
+ */
+function progressLine(stream: NodeJS.WriteStream): ProgressLine {
+  if (!stream.isTTY) {
+    let lastStep = '';
+    return {
+      update: (message) => {
+        const step = message.split(':')[0];
+        if (step === lastStep) return;
+        lastStep = step;
+        stream.write(`${message}\n`);
+      },
+      stop: () => {},
+    };
+  }
+
+  const started = Date.now();
+  let message = '';
+  let frame = 0;
+  const draw = () => {
+    const seconds = Math.round((Date.now() - started) / 1000);
+    const line = `${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} ${seconds}s  ${message}`;
+    frame += 1;
+    stream.write(`\r\x1b[2K${line.slice(0, (stream.columns || 80) - 1)}`);
+  };
+  const timer = setInterval(draw, 100);
+  timer.unref();
+  return {
+    update: (next) => {
+      message = next;
+      draw();
+    },
+    stop: () => {
+      clearInterval(timer);
+      stream.write('\r\x1b[2K');
+    },
+  };
 }
 
 function flagValue(flags: string[], name: string): string | null {

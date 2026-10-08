@@ -35,24 +35,28 @@ export function reportUrlForKey(siteKey: string): string {
 
 export async function scanSite(url: string, options: ScanSiteOptions = {}): Promise<ScanSiteResult> {
   const { models, profile, onProgress } = options;
+  onProgress?.(`Finding the docs at ${url}`);
   const resolved = await resolveSubmittedUrl(url, profile);
   onProgress?.(`Scanning ${resolved.target.key} (${resolved.target.profile})`);
 
   const reportUrl = options.reportUrl ?? reportUrlForKey(resolved.target.key);
-  const technical = await runTechnicalAssessment({
-    target: resolved.target,
-    profileChosen: !!profile,
-    hashRouted: resolved.hashRouted,
-    reportUrl,
-    answerabilityPlanned: !!models,
-    answerabilityUnavailableReason: 'Answerability was not tested in this scan. Run it with --ai <provider> and your own API key.',
-  });
+  const technical = await runTechnicalAssessment(
+    {
+      target: resolved.target,
+      profileChosen: !!profile,
+      hashRouted: resolved.hashRouted,
+      reportUrl,
+      answerabilityPlanned: !!models,
+      answerabilityUnavailableReason: 'Answerability was not tested in this scan. Run it with --ai <provider> and your own API key.',
+    },
+    { onProgress },
+  );
   if (!models) return { report: technical.report, answerabilityCostUsd: 0 };
 
   onProgress?.('Technical checks done; testing answers');
   const run = await runAnswerability(
     { target: technical.report.target, sampledUrls: technical.sampledUrls },
-    { models },
+    { models, onProgress },
   );
   return { report: finalizeReport(technical.report, run.result, reportUrl), answerabilityCostUsd: run.costUsd };
 }

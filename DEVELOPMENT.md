@@ -10,24 +10,24 @@ npm run build      # dist/
 npm run check -- https://docs.example.com   # the CLI from source
 ```
 
-## Where the code comes from
+## Where it runs
 
-`src/` is the engine of the hosted scanner at [documentation.ai/agent-score](https://documentation.ai/agent-score), copied here unchanged so the website and this package give the same scores. The Documentation.AI team changes the engine in its backend first, then copies it over:
+This repository is the engine's only home. The hosted scanner at [documentation.ai/agent-score](https://documentation.ai/agent-score) installs this package, pinned to an exact version, so the website and the CLI give the same scores. A change reaches the website after it is released and the Documentation.AI backend moves to the new version.
 
-```sh
-rsync -a --delete --exclude='/README.md' --exclude='/__tests__/packageVersions.vitest.ts' \
-  ../documentation-ai-backend/src/services/agent-score/ src/
-```
+## Rules
 
-`src/__tests__/packageVersions.vitest.ts` belongs to this repository: it checks that AFDocs is pinned to the version the methodology names, and that `ENGINE_VERSION` matches `version` in `package.json`.
-
-A pull request merged here also has to be made in the backend, or the next copy removes it.
+- Only `src/cli.ts` reads environment variables. Everything else takes its settings as arguments, so the hosted scanner and the CLI run the same code.
+- Any change that can move a score needs a new `METHODOLOGY_VERSION` in `src/methodology.ts`, because scores from different versions are not comparable.
+- AFDocs is pinned to an exact version. `src/__tests__/packageVersions.vitest.ts` checks it matches `AFDOCS_VERSION`, and that `ENGINE_VERSION` matches `version` in `package.json`.
+- The crawler list in `src/checks/crawlerAccess.ts` names each provider's published robots.txt policy and the date it was read; re-read the sources before changing it.
 
 ## Releasing
 
-1. In the backend, bump `ENGINE_VERSION` in `methodology.ts` (and `METHODOLOGY_VERSION` when scores can move), then copy the engine over and set the same `version` in `package.json`.
+1. Set the new version in `ENGINE_VERSION` (`src/methodology.ts`) and in `package.json` (`npm version <version> --no-git-tag-version`), and bump `METHODOLOGY_VERSION` when scores can move.
 2. Commit and push to `main`.
 3. `npm run release -- --dry-run` checks everything without publishing; `npm run release` publishes. It stops unless the tree is committed and matches GitHub's `main`, tests, typechecks and builds, checks that the package holds no source maps, keys, local paths or internal services, runs the packed CLI, publishes to npm (npm may ask for your one-time password), and checks that npm serves it. See [scripts/release.mjs](scripts/release.mjs).
-4. Tag it: `git tag v<version> && git push origin v<version>`.
+4. If npm holds the version for approval, approve it under **Staged Packages** on npmjs.com, then check `npm view @documentation.ai/agent-score version`.
+5. Tag it: `git tag v<version> && git push origin v<version>`.
+6. For the website, install the new version in the backend: `npm install @documentation.ai/agent-score@<version> --save-exact`.
 
 npm receives a staged copy in `.npm-package/`: the built code, README, LICENSE and a `package.json` cut down to what installers use, so the scripts and dev tools here never ship. Publishing needs an npm account with publish rights in the `documentation.ai` organisation.

@@ -68,7 +68,7 @@ const models = await createAnswerabilityModels({
 const { report: full, answerabilityCostUsd } = await scanSite('https://docs.example.com', { models });
 ```
 
-`scanSite` runs every stage in one call. To run the stages as separate jobs, as the hosted scanner does, call `resolveTarget`, `runTechnicalAssessment`, `runAnswerability` and `finalizeReport` yourself. The report's shape is exported as the `AgentScoreReport` type.
+`scanSite` runs every stage in one call; pass `onProgress` to get a short message at each step, as the CLI shows them. To run the stages as separate jobs, as the hosted scanner does, call `resolveTarget`, `runTechnicalAssessment`, `runAnswerability` and `finalizeReport` yourself. The report's shape is exported as the `AgentScoreReport` type.
 
 ## How the scanner behaves on your site
 

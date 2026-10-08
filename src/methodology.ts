@@ -8,7 +8,7 @@ import type { Grade } from './report.types';
 
 export const METHODOLOGY_VERSION = '2026-09.6';
 /** The engine's own version, recorded in every report; the npm version once the engine is published. */
-export const ENGINE_VERSION = '0.2.0';
+export const ENGINE_VERSION = '0.2.1';
 /** Pinned exactly in package.json; packageVersions.vitest.ts keeps the two in step. */
 export const AFDOCS_VERSION = '0.20.0';
 
